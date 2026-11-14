@@ -14,6 +14,8 @@
 #include "unlock_touch_gate.hpp"
 #include "src/misc/cache/instance/lv_image_cache.h"
 
+#include <android-base/properties.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -289,7 +291,8 @@ public:
     }
 
     gpu_accelerated_ =
-        direct_scanout_ &&
+        (direct_scanout_ ||
+         !android::base::GetProperty("ro.aera.gpu.mali_driver", "").empty()) &&
         gpu_renderer_.Initialize(physical_width_, physical_height_);
     lv_draw_opengles_set_enabled(gpu_accelerated_);
     lv_init();
@@ -387,7 +390,7 @@ public:
         "rendering (%.2f MiB); "
         "%u Hz scheduler",
         width_, height_, physical_width_, physical_height_,
-        gpu_accelerated_ ? "zero-copy Adreno/LVGL"
+        gpu_accelerated_ ? "zero-copy EGL/LVGL"
                          : (direct_scanout_ ? "software DRM scanout"
                                             : "minui fallback"),
         static_cast<double>(buffer_size_) / (1024.0 * 1024.0),
@@ -3906,7 +3909,7 @@ private:
       if (lv_display_flush_is_last(display)) {
         if (!self->gpu_renderer_.Present(display)) {
           __android_log_print(ANDROID_LOG_ERROR, kLogTag,
-                              "Adreno rejected the LVGL frame");
+                              "GPU rejected the LVGL frame");
         } else {
           self->TrackSubmittedFrame();
           recorder::CapturePresentedFrame();

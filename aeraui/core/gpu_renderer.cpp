@@ -4,7 +4,9 @@
  */
 
 #include "gpu_renderer.hpp"
+#include "mali_display.hpp"
 
+#include <android-base/properties.h>
 #include <android/log.h>
 #include <android/hardware_buffer.h>
 #include <vndk/hardware_buffer.h>
@@ -112,36 +114,47 @@ GpuRenderer::~GpuRenderer() {
 
 bool GpuRenderer::Initialize(int32_t width, int32_t height) {
   Shutdown();
+  if (width <= 0 || height <= 0) return false;
   width_ = width;
   height_ = height;
 
-  egl_library_ = dlopen(kEglDriver, RTLD_NOW | RTLD_GLOBAL);
-  if (egl_library_ == nullptr) {
-    __android_log_print(ANDROID_LOG_WARN, kLogTag,
-                        "Adreno EGL unavailable: %s", dlerror());
-    return false;
-  }
-  gles_library_ = dlopen(kGlesDriver, RTLD_NOW | RTLD_GLOBAL);
-  if (gles_library_ == nullptr) {
-    __android_log_print(ANDROID_LOG_WARN, kLogTag,
-                        "Adreno GLES unavailable: %s", dlerror());
-    Shutdown();
-    return false;
-  }
-  nativewindow_library_ = dlopen(kNativeWindowLibrary, RTLD_NOW | RTLD_GLOBAL);
-  // Some recovery device trees package the matching native-window runtime in
-  // /system as well: inspecting Android's vendor partition temporarily hides
-  // the ramdisk copy. Keep the existing vendor runtime as the first choice.
-  if (nativewindow_library_ == nullptr) {
-    nativewindow_library_ = dlopen("/system/lib64/libnativewindow.so",
-                                 RTLD_NOW | RTLD_GLOBAL);
-  }
-  if (nativewindow_library_ == nullptr) {
-    __android_log_print(ANDROID_LOG_WARN, kLogTag,
-                        "Android native-buffer runtime unavailable: %s",
-                        dlerror());
-    Shutdown();
-    return false;
+  if (!android::base::GetProperty("ro.aera.gpu.mali_driver", "").empty()) {
+    mali_display_ = new MaliDisplay();
+    egl_library_ = mali_display_->OpenDriver();
+    if (egl_library_ == nullptr) {
+      Shutdown();
+      return false;
+    }
+    gles_library_ = egl_library_;
+  } else {
+    egl_library_ = dlopen(kEglDriver, RTLD_NOW | RTLD_GLOBAL);
+    if (egl_library_ == nullptr) {
+      __android_log_print(ANDROID_LOG_WARN, kLogTag,
+                          "Adreno EGL unavailable: %s", dlerror());
+      return false;
+    }
+    gles_library_ = dlopen(kGlesDriver, RTLD_NOW | RTLD_GLOBAL);
+    if (gles_library_ == nullptr) {
+      __android_log_print(ANDROID_LOG_WARN, kLogTag,
+                          "Adreno GLES unavailable: %s", dlerror());
+      Shutdown();
+      return false;
+    }
+    nativewindow_library_ = dlopen(kNativeWindowLibrary, RTLD_NOW | RTLD_GLOBAL);
+    // Some recovery device trees package the matching native-window runtime in
+    // /system as well: inspecting Android's vendor partition temporarily hides
+    // the ramdisk copy. Keep the existing vendor runtime as the first choice.
+    if (nativewindow_library_ == nullptr) {
+      nativewindow_library_ = dlopen("/system/lib64/libnativewindow.so",
+                                   RTLD_NOW | RTLD_GLOBAL);
+    }
+    if (nativewindow_library_ == nullptr) {
+      __android_log_print(ANDROID_LOG_WARN, kLogTag,
+                          "Android native-buffer runtime unavailable: %s",
+                          dlerror());
+      Shutdown();
+      return false;
+    }
   }
 
   PFNEGLGETDISPLAYPROC get_display = nullptr;
@@ -153,7 +166,7 @@ bool GpuRenderer::Initialize(int32_t width, int32_t height) {
       !LoadBootstrap(egl_library_, "eglGetProcAddress", &get_proc_address) ||
       !LoadBootstrap(egl_library_, "eglTerminate", &terminate)) {
     __android_log_print(ANDROID_LOG_WARN, kLogTag,
-                        "Adreno EGL bootstrap is incomplete");
+                        "EGL bootstrap is incomplete");
     Shutdown();
     return false;
   }
@@ -194,7 +207,7 @@ bool GpuRenderer::Initialize(int32_t width, int32_t height) {
   if (!eglChooseConfig(display, config_attributes, &config, 1, &config_count) ||
       config_count != 1) {
     __android_log_print(ANDROID_LOG_WARN, kLogTag,
-                        "no compatible Adreno pbuffer config");
+                        "no compatible EGL pbuffer config");
     Shutdown();
     return false;
   }
@@ -212,7 +225,7 @@ bool GpuRenderer::Initialize(int32_t width, int32_t height) {
   if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT ||
       !eglMakeCurrent(display, surface, surface, context)) {
     __android_log_print(ANDROID_LOG_WARN, kLogTag,
-                        "Adreno context creation failed: %#x", eglGetError());
+                        "EGL context creation failed: %#x", eglGetError());
     egl_surface_ = surface;
     egl_context_ = context;
     Shutdown();
@@ -239,9 +252,58 @@ bool GpuRenderer::Initialize(int32_t width, int32_t height) {
       eglCreateImageKHR == nullptr || eglDestroyImageKHR == nullptr ||
       image_target == nullptr) {
     __android_log_print(ANDROID_LOG_WARN, kLogTag,
-                        "Adreno native-buffer image import is unavailable");
+                        "native-buffer image import is unavailable");
     Shutdown();
     return false;
+  }
+
+  if (mali_display_ != nullptr) {
+    if (android::base::GetProperty("ro.aera.gpu.native_fence", "false") == "true" &&
+        HasExtension(egl_extensions, "EGL_ANDROID_native_fence_sync") &&
+        eglCreateSyncKHR != nullptr && eglDestroySyncKHR != nullptr) {
+      duplicate_native_fence_ = reinterpret_cast<int (*)(void*, void*)>(
+          LoadSymbol(&egl_loader, "eglDupNativeFenceFDANDROID"));
+    }
+    if (!mali_display_->Initialize(width_, height_)) {
+      Shutdown();
+      return false;
+    }
+    buffer_count_ = mali_display_->BufferCount();
+    for (unsigned i = 0; i < buffer_count_; ++i) {
+      const EGLint attributes[] = {
+          EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE,
+      };
+      egl_images_[i] = eglCreateImageKHR(
+          display, EGL_NO_CONTEXT, kEglNativeBufferAndroid,
+          mali_display_->Buffer(i), attributes);
+      if (egl_images_[i] == EGL_NO_IMAGE_KHR) {
+        Shutdown();
+        return false;
+      }
+      glGenTextures(1, &textures_[i]);
+      glBindTexture(GL_TEXTURE_2D, textures_[i]);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      image_target(GL_TEXTURE_2D, egl_images_[i]);
+      glGenFramebuffers(1, &framebuffers_[i]);
+      glBindFramebuffer(GL_FRAMEBUFFER, framebuffers_[i]);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             GL_TEXTURE_2D, textures_[i], 0);
+      if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        Shutdown();
+        return false;
+      }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    ready_ = true;
+    __android_log_print(ANDROID_LOG_INFO, kLogTag,
+                        "Mali HWC2 GPU ready: %s; %u shared buffers without readback; native fence %s",
+                        reinterpret_cast<const char*>(glGetString(GL_RENDERER)),
+                        buffer_count_,
+                        duplicate_native_fence_ != nullptr ? "enabled" : "disabled");
+    return true;
   }
 
   auto allocate_buffer = reinterpret_cast<AllocateHardwareBuffer>(
@@ -412,6 +474,12 @@ bool GpuRenderer::Present(lv_display_t* display) {
 
   const unsigned int index = next_buffer_;
   glBindFramebuffer(GL_FRAMEBUFFER, framebuffers_[index]);
+  if (mali_display_ != nullptr) {
+    // Submit the offscreen canvas while HWC finishes with the scanout buffer.
+    // Wait before clearing or drawing into that buffer.
+    glFlush();
+    if (!mali_display_->Wait(index)) return false;
+  }
   glViewport(0, 0, width_, height_);
   glDisable(GL_SCISSOR_TEST);
   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -419,24 +487,38 @@ bool GpuRenderer::Present(lv_display_t* display) {
   // The native scanout and LVGL texture share the panel's portrait orientation.
   // No additional axis mirroring is required for the final composition.
   lv_opengles_render_display_texture(display, false, false);
-  glFinish();
+  int acquire_fence = -1;
+  if (duplicate_native_fence_ != nullptr) {
+    constexpr EGLenum kNativeFenceAndroid = 0x3144;
+    const EGLint attributes[] = {EGL_NONE};
+    EGLSyncKHR sync = eglCreateSyncKHR(egl_display_, kNativeFenceAndroid, attributes);
+    if (sync != EGL_NO_SYNC_KHR) {
+      glFlush();
+      acquire_fence = duplicate_native_fence_(egl_display_, sync);
+      eglDestroySyncKHR(egl_display_, sync);
+    }
+  }
+  if (acquire_fence < 0) glFinish();
   const GLenum present_error = glGetError();
   if (present_error != GL_NO_ERROR) {
     static unsigned int failures = 0;
     if (++failures == 1 || failures % 120 == 0)
       __android_log_print(ANDROID_LOG_ERROR, kLogTag,
                           "scanout composition error: %#x", present_error);
+    if (acquire_fence >= 0) close(acquire_fence);
     return false;
   }
-  if (gr_drm_present(scanouts_[index]) != 0)
+  if (mali_display_ != nullptr ? !mali_display_->Present(index, acquire_fence)
+                               : gr_drm_present(scanouts_[index]) != 0)
     return false;
 
-  next_buffer_ = 1U - index;
+  next_buffer_ = mali_display_ != nullptr ? (index + 1U) % buffer_count_ : 1U - index;
   return true;
 }
 
 void GpuRenderer::Shutdown() {
   ready_ = false;
+  duplicate_native_fence_ = nullptr;
   if (egl_display_ != nullptr && egl_context_ != nullptr &&
       egl_surface_ != nullptr && eglMakeCurrent != nullptr) {
     eglMakeCurrent(static_cast<EGLDisplay>(egl_display_),
@@ -446,10 +528,10 @@ void GpuRenderer::Shutdown() {
     if (driver_initialized_)
       lv_opengles_deinit();
     if (glDeleteFramebuffers != nullptr)
-      glDeleteFramebuffers(2, framebuffers_);
+      glDeleteFramebuffers(buffer_count_, framebuffers_);
     if (glDeleteTextures != nullptr)
-      glDeleteTextures(2, textures_);
-    for (unsigned int i = 0; i < 2; ++i) {
+      glDeleteTextures(buffer_count_, textures_);
+    for (unsigned int i = 0; i < buffer_count_; ++i) {
       if (egl_images_[i] != nullptr && eglDestroyImageKHR != nullptr)
         eglDestroyImageKHR(static_cast<EGLDisplay>(egl_display_),
                            static_cast<EGLImageKHR>(egl_images_[i]));
@@ -474,17 +556,22 @@ void GpuRenderer::Shutdown() {
       ? nullptr
       : reinterpret_cast<ReleaseHardwareBuffer>(
             dlsym(nativewindow_library_, "AHardwareBuffer_release"));
-  for (unsigned int i = 0; i < 2; ++i) {
+  for (unsigned int i = 0; i < buffer_count_; ++i) {
     if (scanouts_[i] != nullptr && release_scanout != nullptr)
       release_scanout(scanouts_[i]);
     if (hardware_buffers_[i] != nullptr && release_buffer != nullptr)
       release_buffer(hardware_buffers_[i]);
     hardware_buffers_[i] = nullptr;
   }
-  if (gles_library_ != nullptr)
-    dlclose(gles_library_);
-  if (egl_library_ != nullptr)
-    dlclose(egl_library_);
+  if (mali_display_ != nullptr) {
+    delete mali_display_;
+    mali_display_ = nullptr;
+  } else {
+    if (gles_library_ != nullptr)
+      dlclose(gles_library_);
+    if (egl_library_ != nullptr)
+      dlclose(egl_library_);
+  }
   if (nativewindow_library_ != nullptr)
     dlclose(nativewindow_library_);
 
@@ -494,7 +581,7 @@ void GpuRenderer::Shutdown() {
   egl_display_ = nullptr;
   egl_surface_ = nullptr;
   egl_context_ = nullptr;
-  for (unsigned int i = 0; i < 2; ++i) {
+  for (unsigned int i = 0; i < buffer_count_; ++i) {
     egl_images_[i] = nullptr;
     textures_[i] = 0;
     framebuffers_[i] = 0;
@@ -505,6 +592,7 @@ void GpuRenderer::Shutdown() {
   logical_width_ = 0;
   logical_height_ = 0;
   next_buffer_ = 0;
+  buffer_count_ = 2;
   driver_initialized_ = false;
 }
 

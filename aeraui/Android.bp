@@ -85,6 +85,7 @@ cc_library_static {
         "features/developer/kernel_settings.cpp",
         "core/engine.cpp",
         "core/gpu_renderer.cpp",
+        "core/mali_display.cpp",
         "core/runner.cpp",
         "core/status_bar.cpp",
         "scenes/mobile_data_scene.cpp",
@@ -198,6 +199,8 @@ cc_library_static {
     header_libs: [
         "libarect_headers",
         "libnativewindow_headers",
+        "libnativebase_headers",
+        "libhardware_headers",
     ],
     static_libs: [
         "libaera_webp_decoder",

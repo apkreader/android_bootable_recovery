@@ -584,3 +584,11 @@ target_link_libraries(unlock_touch_gate_test PRIVATE lvgl)
 add_test(NAME unlock_requires_fresh_touch COMMAND unlock_touch_gate_test)
 
 add_test(NAME lock_behavior_cards COMMAND ui_check --lock-behavior)
+
+get_filename_component(AERA_ANDROID_SOURCE_ROOT "${LVGL_DIR}/../.." ABSOLUTE)
+if(EXISTS "${AERA_ANDROID_SOURCE_ROOT}/hardware/libhardware/include/hardware/gralloc1.h")
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(NAME gpu_backend_lifecycle COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/gpu_backends_test.py"
+    --android-root "${AERA_ANDROID_SOURCE_ROOT}")
+endif()

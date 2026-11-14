@@ -13,10 +13,10 @@
 struct AHardwareBuffer;
 
 namespace aeraui {
+class MaliDisplay;
 
-// Owns the recovery-local Adreno EGL context and imports minui's two DRM
-// scanout buffers. Nothing is linked against the vendor driver: every entry
-// point is resolved at runtime so the software renderer remains bootable.
+// Loads vendor EGL at runtime and imports double-buffered scanout targets.
+// Failed GPU setup leaves the software renderer available.
 class GpuRenderer final {
  public:
   GpuRenderer() = default;
@@ -38,11 +38,12 @@ class GpuRenderer final {
   void* egl_display_ = nullptr;
   void* egl_surface_ = nullptr;
   void* egl_context_ = nullptr;
-  void* egl_images_[2] = {nullptr, nullptr};
-  unsigned int textures_[2] = {0, 0};
-  unsigned int framebuffers_[2] = {0, 0};
-  AHardwareBuffer* hardware_buffers_[2] = {nullptr, nullptr};
-  gr_surface scanouts_[2] = {nullptr, nullptr};
+  void* egl_images_[3] = {};
+  unsigned int textures_[3] = {};
+  unsigned int framebuffers_[3] = {};
+  AHardwareBuffer* hardware_buffers_[3] = {};
+  gr_surface scanouts_[3] = {};
+  unsigned buffer_count_ = 2;
   int32_t width_ = 0;
   int32_t height_ = 0;
   int32_t logical_width_ = 0;
@@ -50,6 +51,8 @@ class GpuRenderer final {
   unsigned int next_buffer_ = 0;
   bool driver_initialized_ = false;
   bool ready_ = false;
+  MaliDisplay* mali_display_ = nullptr;
+  int (*duplicate_native_fence_)(void*, void*) = nullptr;
 };
 
 }  // namespace aeraui

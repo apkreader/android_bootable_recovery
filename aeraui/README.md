@@ -27,6 +27,31 @@ canvas renders across the complete native framebuffer without letterbox bars,
 and physical touch coordinates are mapped back to it. Leaving adaptive mode
 unset retains native one-to-one rendering.
 
+### Legacy Mali
+
+Setup and test instructions are in [MALI_TESTING.md](MALI_TESTING.md).
+
+Mali devices with gralloc1 and HWC2 can use the stock EGL/GLES driver. The device
+must make the matching driver libraries available before starting recovery.
+Set these properties in the device startup configuration:
+
+| Property | Value |
+| --- | --- |
+| `ro.aera.gpu.mali_driver` | Absolute path to the combined EGL/GLES library; enables the Mali backend. |
+| `ro.aera.gpu.mali_libraries` | Library search paths for its stock dependencies, separated by colons. |
+| `ro.aera.gpu.gralloc` | Absolute path to the gralloc1 HAL. |
+| `ro.aera.gpu.hwcomposer` | Absolute path to the HWC2 HAL. |
+| `ro.aera.gpu.mali_permitted_paths` | Paths allowed in the driver namespace; defaults to `/vendor`. |
+| `ro.aera.gpu.mali_linker` | Library exporting the Android linker namespace API; defaults to `libdl_android.so`. |
+| `ro.aera.gpu.native_fence` | Set to `true` to use native acquire fences when EGL supports them; disabled by default. |
+| `ro.aera.gpu.mali_buffers` | Number of scanout buffers: `2` by default, or `3`. |
+| `ro.aera.gpu.hwc_acquire_fence_ownership` | `caller` by default. Use `composer` for HALs that consume the acquire fence descriptor. |
+
+HWC presents imported GPU buffers without framebuffer readback. If native
+fence creation fails, presentation waits for GLES to finish before submitting
+the buffer. Failed backend initialization leaves the software renderer active.
+Devices without `ro.aera.gpu.mali_driver` retain the existing DRM/Adreno path.
+
 For bring-up, create `/tmp/aeraui-capture` over ADB. The runner removes
 the request and writes the current framebuffer to `/tmp/aeraui.png`.
 
