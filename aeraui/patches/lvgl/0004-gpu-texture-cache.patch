@@ -1,0 +1,1670 @@
+diff --git a/lv_conf.h b/lv_conf.h
+index bbcc50c..b482901 100644
+--- a/lv_conf.h
++++ b/lv_conf.h
+@@ -28,7 +28,7 @@
+ #define LV_DRAW_SW_DRAW_UNIT_CNT 1
+ #define LV_DRAW_SW_COMPLEX 1
+ #define LV_USE_DRAW_SW_COMPLEX_GRADIENTS 1
+-#define LV_DRAW_SW_SHADOW_CACHE_SIZE 0
++#define LV_DRAW_SW_SHADOW_CACHE_SIZE 64
+ #define LV_DRAW_SW_CIRCLE_CACHE_SIZE 8
+ #if defined(__aarch64__)
+ #define LV_USE_DRAW_SW_ASM LV_DRAW_SW_ASM_NEON
+@@ -56,7 +56,7 @@
+ #define LV_USE_DRAW_VG_LITE 0
+ #define LV_USE_DRAW_DMA2D 0
+ #define LV_USE_DRAW_OPENGLES 1
+-#define LV_DRAW_OPENGLES_TEXTURE_CACHE_COUNT 128
++#define LV_DRAW_OPENGLES_TEXTURE_CACHE_COUNT 512
+ // LVGL's debug wrapper repeatedly drains glGetError() before and after every
+ // call. Qualcomm's recovery EGL stack can report a persistent error while a
+ // native scanout image is attached, turning that drain loop into a 100% CPU
+diff --git a/src/draw/opengles/lv_draw_opengles.c b/src/draw/opengles/lv_draw_opengles.c
+index 2f1f907..767a601 100644
+--- a/src/draw/opengles/lv_draw_opengles.c
++++ b/src/draw/opengles/lv_draw_opengles.c
+@@ -8,6 +8,16 @@
+  *********************/
+ 
+ #include "lv_draw_opengles.h"
++#include "../lv_draw_label_private.h"
++#include "../../font/fmt_txt/lv_font_fmt_txt.h"
++#if LV_USE_FREETYPE
++#include "../../libs/freetype/lv_freetype.h"
++#endif
++#include <stdio.h>
++#include <stddef.h>
++#include <math.h>
++#include <string.h>
++/* AERA_LABEL_CONTENT_CACHE */
+ #if LV_USE_DRAW_OPENGLES
+ 
+ #if LV_USE_DRAW_NANOVG
+@@ -22,6 +32,7 @@
+ #include "../../drivers/opengles/lv_opengles_private.h"
+ #include "../../draw/lv_draw_label.h"
+ #include "../../draw/lv_draw_rect.h"
++#include "../../draw/lv_draw_mask.h"
+ #include "../../draw/lv_draw_arc.h"
+ #include "../../draw/lv_draw_image.h"
+ #include "../../draw/lv_draw_triangle.h"
+@@ -37,6 +48,196 @@
+  *      DEFINES
+  *********************/
+ 
++/* Experimental box-filter shadow generator. */
++#include <stdbool.h>
++#include <stdio.h>
++#ifndef GL_VERTEX_ARRAY_BINDING
++#define GL_VERTEX_ARRAY_BINDING 0x85B5
++#endif
++
++typedef struct {
++    int width, height, blur_width;
++    float core[4], background[4];
++    float core_radius, background_radius;
++    unsigned char color[3]; /* Stored texture order, matching the cache. */
++} gpu_shadow_params_t;
++
++static GLuint gpu_shadow_program, gpu_shadow_vao, gpu_shadow_vbo;
++
++static GLuint gpu_shadow_compile(GLenum type, const char * source)
++{
++    GLuint shader = glCreateShader(type);
++    glShaderSource(shader, 1, &source, NULL);
++    glCompileShader(shader);
++    GLint ok = 0;
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
++    if(!ok) {
++        char log[1024];
++        glGetShaderInfoLog(shader, sizeof(log), NULL, log);
++        fprintf(stderr, "Shadow shader: %s\n", log);
++        glDeleteShader(shader);
++        return 0;
++    }
++    return shader;
++}
++
++static void gpu_shadow_deinit(void)
++{
++    if(gpu_shadow_vbo) glDeleteBuffers(1, &gpu_shadow_vbo);
++    if(gpu_shadow_vao) glDeleteVertexArrays(1, &gpu_shadow_vao);
++    if(gpu_shadow_program) glDeleteProgram(gpu_shadow_program);
++    gpu_shadow_vbo = gpu_shadow_vao = gpu_shadow_program = 0;
++}
++
++static bool gpu_shadow_init(void)
++{
++    if(gpu_shadow_program) return true;
++    const char * vertex =
++        "attribute highp vec2 position;\n"
++        "void main(){gl_Position=vec4(position,0.0,1.0);}\n";
++    const char * fragment =
++        "precision highp float;\n"
++        "uniform sampler2D mask;\n"
++        "uniform vec2 size;\n"
++        "uniform vec4 core,background;\n"
++        "uniform float coreRadius,backgroundRadius;\n"
++        "uniform vec3 colour;\n"
++        "uniform int mode,kernel;\n"
++        "float coverage(vec2 pixel,vec4 rect,float radius){\n"
++        " if(min(rect.z,rect.w)<=0.0)return 0.0;\n"
++        " vec2 q=abs(pixel-rect.xy-rect.zw*0.5)-rect.zw*0.5+vec2(radius);\n"
++        " float d=length(max(q,vec2(0.0)))+min(max(q.x,q.y),0.0)-radius;\n"
++        " return clamp(0.5-d,0.0,1.0);}\n"
++        "void main(){vec2 pixel=gl_FragCoord.xy;\n"
++        " if(mode==0){gl_FragColor=vec4(coverage(pixel,core,coreRadius));return;}\n"
++        " if(mode==3){float a=texture2D(mask,pixel/size).r;\n"
++        "  a*=1.0-coverage(pixel,background,backgroundRadius);\n"
++        "  gl_FragColor=vec4(colour,a);return;}\n"
++        " int left=kernel/2;\n"
++        " if(kernel-2*(kernel/2)==0){\n"
++        "  float position=mode==1?pixel.x:pixel.y;\n"
++        "  float centre=mode==1?core.x+core.z*0.5:core.y+core.w*0.5;\n"
++        "  if(position>=centre)left-=1;}\n"
++        " float sum=0.0;\n"
++        " for(int i=0;i<128;i++){if(i>=kernel)break;\n"
++        "  vec2 delta=mode==1?vec2(float(i-left),0.0):vec2(0.0,float(i-left));\n"
++        "  sum+=texture2D(mask,(pixel+delta)/size).r;}\n"
++        " gl_FragColor=vec4(sum/float(kernel));}\n";
++    GLuint vs = gpu_shadow_compile(GL_VERTEX_SHADER, vertex);
++    GLuint fs = gpu_shadow_compile(GL_FRAGMENT_SHADER, fragment);
++    if(!vs || !fs) {
++        if(vs) glDeleteShader(vs);
++        if(fs) glDeleteShader(fs);
++        return false;
++    }
++    gpu_shadow_program = glCreateProgram();
++    glAttachShader(gpu_shadow_program, vs);
++    glAttachShader(gpu_shadow_program, fs);
++    glBindAttribLocation(gpu_shadow_program, 0, "position");
++    glLinkProgram(gpu_shadow_program);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++    GLint ok = 0;
++    glGetProgramiv(gpu_shadow_program, GL_LINK_STATUS, &ok);
++    if(!ok) { gpu_shadow_deinit(); return false; }
++    glGenVertexArrays(1, &gpu_shadow_vao);
++    glGenBuffers(1, &gpu_shadow_vbo);
++    glBindVertexArray(gpu_shadow_vao);
++    glBindBuffer(GL_ARRAY_BUFFER, gpu_shadow_vbo);
++    const float vertices[] = {-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1};
++    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
++    glEnableVertexAttribArray(0);
++    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(float), NULL);
++    return true;
++}
++
++/* Returns a straight-alpha texture. Caller owns it; no CPU pixel buffer is used. */
++static GLuint gpu_shadow_generate(const gpu_shadow_params_t * p)
++{
++    GLint maximum = 0;
++    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maximum);
++    if(p->width <= 0 || p->height <= 0 || p->width > maximum || p->height > maximum ||
++       p->blur_width < 1 || p->blur_width > 128) return 0;
++
++    GLint old_fbo, old_program, old_vao, old_buffer, old_unit, old_texture, viewport[4];
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &old_fbo);
++    glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
++    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
++    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
++    glGetIntegerv(GL_ACTIVE_TEXTURE, &old_unit);
++    glGetIntegerv(GL_VIEWPORT, viewport);
++    GLboolean blend = glIsEnabled(GL_BLEND), scissor = glIsEnabled(GL_SCISSOR_TEST);
++    glActiveTexture(GL_TEXTURE0);
++    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture);
++
++    GLuint textures[2] = {0,0}, fbo = 0, result = 0;
++    bool ok = gpu_shadow_init();
++    if(ok) {
++        glGenTextures(2, textures);
++        for(int i=0; i<2; ++i) {
++            glBindTexture(GL_TEXTURE_2D, textures[i]);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++            glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,p->width,p->height,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
++        }
++        glGenFramebuffers(1,&fbo);
++        glBindFramebuffer(GL_FRAMEBUFFER,fbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,textures[0],0);
++        ok = glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE;
++    }
++    if(ok) {
++        glViewport(0,0,p->width,p->height);
++        glDisable(GL_BLEND);
++        glDisable(GL_SCISSOR_TEST);
++        glUseProgram(gpu_shadow_program);
++        glBindVertexArray(gpu_shadow_vao);
++        glUniform1i(glGetUniformLocation(gpu_shadow_program,"mask"),0);
++        glUniform2f(glGetUniformLocation(gpu_shadow_program,"size"),p->width,p->height);
++        glUniform4fv(glGetUniformLocation(gpu_shadow_program,"core"),1,p->core);
++        glUniform4fv(glGetUniformLocation(gpu_shadow_program,"background"),1,p->background);
++        glUniform1f(glGetUniformLocation(gpu_shadow_program,"coreRadius"),p->core_radius);
++        glUniform1f(glGetUniformLocation(gpu_shadow_program,"backgroundRadius"),p->background_radius);
++        glUniform3f(glGetUniformLocation(gpu_shadow_program,"colour"),p->color[0]/255.f,p->color[1]/255.f,p->color[2]/255.f);
++        glBindTexture(GL_TEXTURE_2D,0);
++        glUniform1i(glGetUniformLocation(gpu_shadow_program,"mode"),0);
++        glDrawArrays(GL_TRIANGLES,0,6);
++        int current=0;
++        int kernels[2]={p->blur_width/2,p->blur_width/2+(p->blur_width&1)};
++        if(kernels[0]<1) kernels[0]=1;
++        if(kernels[1]<1) kernels[1]=1;
++        if(kernels[0]>1) for(int round=0;round<2;++round) {
++            if(kernels[round]<=1) continue;
++            glUniform1i(glGetUniformLocation(gpu_shadow_program,"kernel"),kernels[round]);
++            for(int axis=1;axis<=2;++axis) {
++                glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,textures[1-current],0);
++                glBindTexture(GL_TEXTURE_2D,textures[current]);
++                glUniform1i(glGetUniformLocation(gpu_shadow_program,"mode"),axis);
++                glDrawArrays(GL_TRIANGLES,0,6);
++                current=1-current;
++            }
++        }
++        glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,textures[1-current],0);
++        glBindTexture(GL_TEXTURE_2D,textures[current]);
++        glUniform1i(glGetUniformLocation(gpu_shadow_program,"mode"),3);
++        glDrawArrays(GL_TRIANGLES,0,6);
++        if(glGetError()==GL_NO_ERROR) { result=textures[1-current]; textures[1-current]=0; }
++    }
++    glBindFramebuffer(GL_FRAMEBUFFER,old_fbo);
++    glUseProgram(old_program);
++    glBindVertexArray(old_vao);
++    glBindBuffer(GL_ARRAY_BUFFER,old_buffer);
++    glBindTexture(GL_TEXTURE_2D,old_texture);
++    glActiveTexture(old_unit);
++    glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
++    if(blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
++    if(scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
++    if(fbo) glDeleteFramebuffers(1,&fbo);
++    glDeleteTextures(2,textures);
++    return result;
++}
++
+ #define DRAW_UNIT_ID_OPENGLES 6
+ 
+ /**********************
+@@ -82,6 +283,7 @@ typedef struct {
+     int32_t w;
+     int32_t h;
+     uint32_t text_hash;
++    lv_draw_task_type_t task_type;
+     unsigned int texture;
+ } cache_data_t;
+ 
+@@ -98,6 +300,8 @@ static void blend_texture_layer(lv_draw_task_t * t);
+ static bool draw_streaming_image(lv_draw_task_t * t);
+ static bool draw_backdrop_blur(lv_draw_opengles_unit_t * u, lv_draw_task_t * t);
+ static void draw_from_cached_texture(lv_draw_task_t * t);
++static void native_glyph_cleanup(void);
++static void native_line_cleanup(void);
+ 
+ static void execute_drawing(lv_draw_opengles_unit_t * u);
+ 
+@@ -164,6 +368,9 @@ void lv_draw_opengles_deinit(void)
+     if(g_unit->blur_pass_texture != 0) {
+         GL_CALL(glDeleteTextures(1, &g_unit->blur_pass_texture));
+     }
++    gpu_shadow_deinit();
++    native_glyph_cleanup();
++    native_line_cleanup();
+     lv_cache_destroy(g_unit->texture_cache, g_unit);
+     if(g_unit->framebuffer != 0) {
+         GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+@@ -184,7 +391,29 @@ void lv_draw_opengles_set_enabled(bool enabled)
+ static bool opengles_texture_cache_create_cb(cache_data_t * cached_data, void * user_data)
+ {
+     LV_PROFILER_DRAW_BEGIN;
++    static uint32_t window = 0, count = 0, raster_ms = 0;
++    uint32_t started = lv_tick_get();
+     bool ret = draw_to_texture((lv_draw_opengles_unit_t *)user_data, cached_data);
++    uint32_t elapsed = lv_tick_elaps(started);
++    if(elapsed >= 10) {
++        lv_draw_opengles_unit_t * unit = user_data;
++        fprintf(stderr, "AERA slow texture: type=%d size=%dx%d elapsed=%u ms\n",
++                (int)unit->task_act->type, cached_data->w, cached_data->h, elapsed);
++    }
++    raster_ms += lv_tick_elaps(started);
++    ++count;
++    if(lv_tick_elaps(window) >= 1000) {
++        fprintf(stderr, "AERA texture cache raster: %u misses, %u ms, capacity %d\n", count, raster_ms, LV_DRAW_OPENGLES_TEXTURE_CACHE_COUNT);
++        window = lv_tick_get(); count = 0; raster_ms = 0;
++    }
++    if(ret && cached_data->task_type == LV_DRAW_TASK_TYPE_LABEL) {
++        const char * text = cached_data->draw_dsc.label.text;
++        size_t length = lv_strlen(text) + 1;
++        char * owned = lv_malloc(length);
++        if(!owned) { glDeleteTextures(1, &cached_data->texture); return false; }
++        lv_memcpy(owned, text, length);
++        cached_data->draw_dsc.label.text = owned;
++    }
+     LV_PROFILER_DRAW_END;
+     return ret;
+ }
+@@ -194,6 +423,8 @@ static void opengles_texture_cache_free_cb(cache_data_t * cached_data, void * us
+     LV_UNUSED(user_data);
+     LV_PROFILER_DRAW_BEGIN;
+ 
++    if(cached_data->task_type == LV_DRAW_TASK_TYPE_LABEL)
++        lv_free((void *)cached_data->draw_dsc.label.text);
+     GL_CALL(glDeleteTextures(1, &cached_data->texture));
+     cached_data->texture = 0;
+     LV_PROFILER_DRAW_END;
+@@ -202,6 +433,7 @@ static void opengles_texture_cache_free_cb(cache_data_t * cached_data, void * us
+ static lv_cache_compare_res_t opengles_texture_cache_compare_cb(const cache_data_t * lhs, const cache_data_t * rhs)
+ {
+     if(lhs == rhs) return 0;
++    if(lhs->task_type != rhs->task_type) return lhs->task_type > rhs->task_type ? 1 : -1;
+ 
+     if(lhs->w != rhs->w) {
+         return lhs->w > rhs->w ? 1 : -1;
+@@ -222,6 +454,20 @@ static lv_cache_compare_res_t opengles_texture_cache_compare_cb(const cache_data
+         return lhs_dsc_size > rhs_dsc_size ? 1 : -1;
+     }
+ 
++    if(lhs->task_type == LV_DRAW_TASK_TYPE_LABEL) {
++        int text_compare = lv_strcmp(lhs->draw_dsc.label.text, rhs->draw_dsc.label.text);
++        if(text_compare) return text_compare > 0 ? 1 : -1;
++        lv_draw_label_dsc_t left = lhs->draw_dsc.label;
++        lv_draw_label_dsc_t right = rhs->draw_dsc.label;
++        left.text = NULL; right.text = NULL;
++        left.text_local = right.text_local = 0;
++        left.text_static = right.text_static = 0;
++        int cmp = lv_memcmp((const uint8_t *)&left + sizeof(lv_draw_dsc_base_t),
++                           (const uint8_t *)&right + sizeof(lv_draw_dsc_base_t),
++                           sizeof(left) - sizeof(lv_draw_dsc_base_t));
++        return cmp > 0 ? 1 : cmp < 0 ? -1 : 0;
++    }
++
+     const uint8_t * left_draw_dsc = (const uint8_t *)lhs_draw_dsc;
+     const uint8_t * right_draw_dsc = (const uint8_t *)rhs_draw_dsc;
+     left_draw_dsc += sizeof(lv_draw_dsc_base_t);
+@@ -283,7 +529,6 @@ static int32_t dispatch(lv_draw_unit_t * draw_unit, lv_layer_t * layer)
+         GL_CALL(glDisable(GL_SCISSOR_TEST));
+         GL_CALL(glClearColor(0.0f, 0.0f, 0.0f, 0.0f));
+         GL_CALL(glClear(GL_COLOR_BUFFER_BIT));
+-        GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+     }
+ 
+     t->state = LV_DRAW_TASK_STATE_IN_PROGRESS;
+@@ -324,6 +569,38 @@ static bool draw_to_texture(lv_draw_opengles_unit_t * u, cache_data_t * cache_da
+     LV_PROFILER_DRAW_BEGIN;
+     lv_draw_task_t * task = u->task_act;
+ 
++    if(task->type == LV_DRAW_TASK_TYPE_BOX_SHADOW) {
++        const lv_draw_box_shadow_dsc_t * shadow = task->draw_dsc;
++        gpu_shadow_params_t params = {0};
++        params.width = lv_area_get_width(&task->_real_area);
++        params.height = lv_area_get_height(&task->_real_area);
++        params.blur_width = shadow->width;
++        int32_t x = task->area.x1 - task->_real_area.x1;
++        int32_t y = task->area.y1 - task->_real_area.y1;
++        int32_t width = lv_area_get_width(&task->area);
++        int32_t height = lv_area_get_height(&task->area);
++        params.core[0] = x + shadow->ofs_x - shadow->spread;
++        params.core[1] = y + shadow->ofs_y - shadow->spread;
++        params.core[2] = width + 2 * shadow->spread;
++        params.core[3] = height + 2 * shadow->spread;
++        params.background[0] = x + 1;
++        params.background[1] = y + 1;
++        params.background[2] = width - 2;
++        params.background[3] = height - 2;
++        params.core_radius = LV_MAX(0, LV_MIN(shadow->radius, LV_MIN(params.core[2], params.core[3]) / 2));
++        params.background_radius = LV_MAX(0, LV_MIN(shadow->radius, LV_MIN(width - 2, height - 2) / 2));
++        params.color[0] = shadow->color.blue;
++        params.color[1] = shadow->color.green;
++        params.color[2] = shadow->color.red;
++        unsigned int texture = gpu_shadow_generate(&params);
++        if(texture) {
++            cache_data->w = params.width;
++            cache_data->h = params.height;
++            cache_data->texture = texture;
++            return true;
++        }
++    }
++
+     lv_layer_t dest_layer;
+     lv_layer_init(&dest_layer);
+ 
+@@ -392,7 +669,7 @@ static bool draw_to_texture(lv_draw_opengles_unit_t * u, cache_data_t * cache_da
+                 rect_dsc.base.user_data = (void *)(uintptr_t)1;
+                 rect_dsc.bg_opa = LV_OPA_0;
+                 rect_dsc.radius = box_shadow_dsc->radius;
+-                rect_dsc.bg_color = box_shadow_dsc->color;
++                rect_dsc.shadow_color = box_shadow_dsc->color;
+                 rect_dsc.shadow_opa = box_shadow_dsc->opa;
+                 rect_dsc.shadow_width = box_shadow_dsc->width;
+                 rect_dsc.shadow_spread = box_shadow_dsc->spread;
+@@ -517,11 +794,20 @@ static void blend_texture_layer(lv_draw_task_t * t)
+     lv_area_t clip_area = t->clip_area;
+     lv_area_move(&clip_area, -dest_layer->buf_area.x1,
+                  -dest_layer->buf_area.y1);
+-    lv_opengles_render_texture(src_texture, &area, draw_dsc->opa, targ_tex_w, targ_tex_h, &clip_area, h_flip,
+-                               !v_flip);
++    lv_opengles_render_params_t params;
++    lv_opengles_render_params_init(&params);
++    params.texture = src_texture;
++    params.texture_area = &area;
++    params.texture_clip_area = &clip_area;
++    params.disp_w = targ_tex_w;
++    params.disp_h = targ_tex_h;
++    params.opa = draw_dsc->opa;
++    params.h_flip = h_flip;
++    params.v_flip = !v_flip;
++    params.premultiplied_texture = true;
++    lv_opengles_render(&params);
+ 
+     if(target_texture) {
+-        GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+     }
+ 
+     GL_CALL(glDeleteTextures(1, &src_texture));
+@@ -587,7 +873,6 @@ static bool draw_streaming_image(lv_draw_task_t * t)
+     lv_area_move(&render_area, -dest_layer->buf_area.x1, -dest_layer->buf_area.y1);
+     lv_opengles_render_texture(u->streaming_texture, &render_area, draw_dsc->opa,
+                                target_width, target_height, &clip_area, false, false);
+-    if(target_texture != 0) GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+     return true;
+ }
+ 
+@@ -614,7 +899,6 @@ static bool draw_backdrop_blur(lv_draw_opengles_unit_t * u, lv_draw_task_t * t)
+                                        GL_TEXTURE_2D, target_texture, 0));
+     }
+     else {
+-        GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+     }
+ 
+     if(u->blur_texture == 0) GL_CALL(glGenTextures(1, &u->blur_texture));
+@@ -660,7 +944,6 @@ static bool draw_backdrop_blur(lv_draw_opengles_unit_t * u, lv_draw_task_t * t)
+                                        GL_TEXTURE_2D, target_texture, 0));
+     }
+     else {
+-        GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+     }
+ 
+     lv_area_t render_area = area;
+@@ -670,14 +953,481 @@ static bool draw_backdrop_blur(lv_draw_opengles_unit_t * u, lv_draw_task_t * t)
+                                     target_width, target_height,
+                                     (float)dsc->blur_radius,
+                                     (float)dsc->corner_radius, 0.f, 1.f);
+-    if(target_texture != 0) GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+     return true;
+ }
+ 
++static bool draw_solid_fill(lv_draw_task_t * t);
++
++static bool draw_border_strip(lv_draw_task_t * original, const lv_area_t * area,
++                              const lv_draw_border_dsc_t * border)
++{
++    if(area->x1 > area->x2 || area->y1 > area->y2) return true;
++    lv_draw_fill_dsc_t fill;
++    lv_draw_fill_dsc_init(&fill);
++    fill.color = border->color;
++    fill.opa = border->opa;
++    lv_draw_task_t strip = *original;
++    strip.type = LV_DRAW_TASK_TYPE_FILL;
++    strip.draw_dsc = &fill;
++    strip.area = *area;
++    strip._real_area = *area;
++    return draw_solid_fill(&strip);
++}
++
++static bool draw_straight_border(lv_draw_task_t * t, const lv_draw_border_dsc_t * border)
++{
++    if(border->radius != 0) return false;
++    if(border->width <= 0 || border->side == LV_BORDER_SIDE_NONE) return true;
++    lv_area_t area = t->area;
++    int32_t width = lv_area_get_width(&area);
++    int32_t height = lv_area_get_height(&area);
++    int32_t left = (border->side & LV_BORDER_SIDE_LEFT) ? LV_MIN(border->width, width) : 0;
++    int32_t right = (border->side & LV_BORDER_SIDE_RIGHT) ? LV_MIN(border->width, width - left) : 0;
++    int32_t top = (border->side & LV_BORDER_SIDE_TOP) ? LV_MIN(border->width, height) : 0;
++    int32_t bottom = (border->side & LV_BORDER_SIDE_BOTTOM) ? LV_MIN(border->width, height - top) : 0;
++    /* Disjoint strips prevent corners from receiving opacity twice. */
++    lv_area_t strip = {area.x1, area.y1, area.x2, area.y1 + top - 1};
++    if(!draw_border_strip(t, &strip, border)) return false;
++    strip = (lv_area_t){area.x1, area.y2 - bottom + 1, area.x2, area.y2};
++    if(!draw_border_strip(t, &strip, border)) return false;
++    strip = (lv_area_t){area.x1, area.y1 + top, area.x1 + left - 1, area.y2 - bottom};
++    if(!draw_border_strip(t, &strip, border)) return false;
++    strip = (lv_area_t){area.x2 - right + 1, area.y1 + top, area.x2, area.y2 - bottom};
++    return draw_border_strip(t, &strip, border);
++}
++
++static bool draw_solid_fill(lv_draw_task_t * t)
++{
++    lv_color_t color;
++    lv_opa_t opacity;
++    int32_t radius, border_width = 0;
++    const lv_grad_dsc_t * gradient = NULL;
++    if(t->type == LV_DRAW_TASK_TYPE_FILL) {
++        const lv_draw_fill_dsc_t * fill = t->draw_dsc;
++        if(fill->grad.dir != LV_GRAD_DIR_NONE) {
++            if((fill->grad.dir != LV_GRAD_DIR_HOR && fill->grad.dir != LV_GRAD_DIR_VER) ||
++               fill->grad.extend != LV_GRAD_EXTEND_PAD || fill->grad.stops_count != 2) return false;
++            int32_t extent = fill->grad.dir == LV_GRAD_DIR_HOR ? lv_area_get_width(&t->area) : lv_area_get_height(&t->area);
++            if(((fill->grad.stops[1].frac * extent) >> 8) <= ((fill->grad.stops[0].frac * extent) >> 8)) return false;
++            gradient = &fill->grad;
++        }
++        color = fill->color;
++        opacity = fill->opa;
++        radius = fill->radius;
++    }
++    else if(t->type == LV_DRAW_TASK_TYPE_BORDER) {
++        const lv_draw_border_dsc_t * border = t->draw_dsc;
++        if(border->side != LV_BORDER_SIDE_FULL) return draw_straight_border(t, border);
++        if(border->width <= 0) return true;
++        color = border->color;
++        opacity = border->opa;
++        radius = border->radius;
++        border_width = border->width;
++    }
++    else return false;
++    lv_draw_opengles_unit_t * unit = (lv_draw_opengles_unit_t *)t->draw_unit;
++    lv_layer_t * layer = t->target_layer;
++    unsigned int texture = layer_get_texture(layer);
++    if(!texture) return false;
++    unsigned int framebuffer = get_framebuffer(unit);
++    GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, framebuffer));
++    GL_CALL(glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0));
++    int32_t width = lv_area_get_width(&layer->buf_area);
++    int32_t height = lv_area_get_height(&layer->buf_area);
++    lv_opengles_viewport(0, 0, width, height);
++    lv_area_t area = t->area;
++    lv_area_t clip = t->clip_area;
++    lv_area_move(&area, -layer->buf_area.x1, -layer->buf_area.y1);
++    lv_area_move(&clip, -layer->buf_area.x1, -layer->buf_area.y1);
++    lv_opengles_render_params_t params;
++    lv_opengles_render_params_init(&params);
++    params.texture_area = &area;
++    params.texture_clip_area = &clip;
++    params.disp_w = width;
++    params.disp_h = height;
++    params.fill_color = color;
++    params.shape_border_width = border_width;
++    if(gradient) {
++        params.shape_gradient_dir = gradient->dir;
++        int32_t extent = gradient->dir == LV_GRAD_DIR_HOR ? lv_area_get_width(&area) : lv_area_get_height(&area);
++        for(int i = 0; i < 2; ++i) {
++            params.shape_gradient_colors[i] = gradient->stops[i].color;
++            params.shape_gradient_stops[i] = (gradient->stops[i].frac * extent) >> 8;
++            params.shape_gradient_opacity[i] = gradient->stops[i].opa / 255.f;
++        }
++    }
++    int32_t half = LV_MIN(lv_area_get_width(&area), lv_area_get_height(&area)) / 2;
++    params.blur_corner_radius = LV_MIN(radius, half);
++    params.opa = opacity;
++    params.rb_swap = true;
++    lv_opengles_render(&params);
++    return true;
++}
++
++
++static uint64_t native_font_generation(const lv_font_t * font)
++{
++#if LV_USE_FREETYPE
++    return lv_freetype_bitmap_font_get_cache_id(font);
++#else
++    LV_UNUSED(font);
++    return 0;
++#endif
++}
++
++static bool native_bitmap_font_supported(const lv_font_t * font)
++{
++    return font->get_glyph_dsc == lv_font_get_glyph_dsc_fmt_txt || native_font_generation(font) != 0;
++}
++
++typedef struct {
++    const lv_font_t * font;
++    uint64_t font_generation;
++    uint32_t glyph;
++    uint32_t color;
++    int width, height;
++    unsigned int texture;
++    int x, y;
++} native_glyph_t;
++static native_glyph_t native_glyphs[4096];
++static bool native_glyph_key_matches(const native_glyph_t * entry, const lv_font_t * font,
++                                     uint64_t generation, uint32_t glyph, uint32_t color,
++                                     int width, int height)
++{
++    return entry->texture && entry->font == font && entry->font_generation == generation &&
++           entry->glyph == glyph && entry->color == color && entry->width == width && entry->height == height;
++}
++
++static unsigned int native_atlas_texture;
++static unsigned int native_atlas_pages[16];
++static unsigned int native_batch_texture;
++static int native_atlas_size;
++static unsigned int native_atlas_page, native_atlas_page_count;
++
++static void native_atlas_configure(void)
++{
++    if(native_atlas_size) return;
++    const char * renderer = (const char *)glGetString(GL_RENDERER);
++    bool mali = renderer && strstr(renderer, "Mali");
++    native_atlas_size = mali ? 512 : 2048;
++    native_atlas_page_count = mali ? 16 : 1;
++}
++
++static int native_atlas_x, native_atlas_y, native_atlas_row;
++static float native_vertices[1024*6*4];
++static unsigned native_vertex_count;
++static lv_draw_task_t * native_batch_task;
++static lv_opa_t native_batch_opa;
++static void native_label_flush(void)
++{
++    if(!native_vertex_count) return;
++    lv_layer_t * layer=native_batch_task->target_layer;
++    int width=lv_area_get_width(&layer->buf_area);
++    int height=lv_area_get_height(&layer->buf_area);
++    lv_area_t area={0,0,width-1,height-1};
++    lv_opengles_render_params_t params;
++    lv_opengles_render_params_init(&params);
++    params.texture=native_batch_texture;
++    params.texture_area=&area; params.texture_clip_area=&area;
++    params.disp_w=width; params.disp_h=height;
++    params.opa=native_batch_opa;
++    params.batch_vertices=native_vertices;
++    params.batch_vertex_count=native_vertex_count;
++    lv_opengles_render(&params);
++    native_vertex_count=0;
++}
++static bool native_label_checking;
++static bool native_label_supported;
++
++static void native_glyph_cleanup(void)
++{
++    for(unsigned i=0;i<16;++i)
++        if(native_atlas_pages[i]) glDeleteTextures(1,&native_atlas_pages[i]);
++    lv_memzero(native_atlas_pages,sizeof(native_atlas_pages));
++    native_atlas_size=0;
++    native_atlas_page=native_atlas_page_count=0;
++    native_batch_texture=0;
++    native_atlas_texture=0;
++    native_atlas_x=native_atlas_y=native_atlas_row=0;
++    native_vertex_count=0;
++    lv_memzero(native_glyphs,sizeof(native_glyphs));
++}
++
++static void native_label_glyph(lv_draw_task_t * t, lv_draw_glyph_dsc_t * glyph,
++                               lv_draw_fill_dsc_t * fill, const lv_area_t * fill_area)
++{
++    if(fill && fill_area) { native_label_supported=false; return; }
++    if(!glyph || !glyph->g || !glyph->letter_coords) return;
++    if(!glyph->g->box_w || !glyph->g->box_h) return;
++    if(glyph->rotation || glyph->outline_stroke_width ||
++       !native_bitmap_font_supported(glyph->g->resolved_font) ||
++       (glyph->format != LV_FONT_GLYPH_FORMAT_A1 && glyph->format != LV_FONT_GLYPH_FORMAT_A2 &&
++        glyph->format != LV_FONT_GLYPH_FORMAT_A3 && glyph->format != LV_FONT_GLYPH_FORMAT_A4 &&
++        glyph->format != LV_FONT_GLYPH_FORMAT_A8)) {
++        native_label_supported=false; return;
++    }
++    native_atlas_configure();
++    if(glyph->g->box_w > native_atlas_size-2 || glyph->g->box_h > native_atlas_size-2) {
++        native_label_supported=false; return;
++    }
++    if(native_label_checking || !native_label_supported) return;
++    int width=glyph->g->box_w, height=glyph->g->box_h;
++    uint32_t color=lv_color_to_u32(glyph->color);
++    uint64_t generation=native_font_generation(glyph->g->resolved_font);
++    uintptr_t hash=(uintptr_t)glyph->g->resolved_font;
++    hash ^= (uintptr_t)generation * 2654435761u;
++    hash=(hash>>4) ^ ((uintptr_t)glyph->g->gid.index*2654435761u) ^ color;
++    unsigned first=hash%4096;
++    native_glyph_t * cached=&native_glyphs[first];
++    /* Keep colliding font/colour combinations resident instead of evicting on every draw. */
++    for(unsigned probe=0;probe<16;++probe) {
++        native_glyph_t * slot=&native_glyphs[(first+probe)%4096];
++        if(!slot->texture || native_glyph_key_matches(slot,glyph->g->resolved_font,generation,glyph->g->gid.index,color,width,height)) {
++            cached=slot;
++            break;
++        }
++    }
++    if(!native_glyph_key_matches(cached,glyph->g->resolved_font,generation,glyph->g->gid.index,color,width,height)) {
++        glyph->g->req_raw_bitmap=0;
++        const lv_draw_buf_t * bitmap=lv_font_get_glyph_bitmap(glyph->g,glyph->_draw_buf);
++        if(!bitmap || bitmap->header.cf!=LV_COLOR_FORMAT_A8) { native_label_supported=false; return; }
++        uint8_t * pixels=lv_malloc((size_t)width*height*4);
++        if(!pixels) { native_label_supported=false; return; }
++        for(int y=0;y<height;++y) for(int x=0;x<width;++x) {
++            uint8_t * pixel=pixels+((size_t)y*width+x)*4;
++            pixel[0]=glyph->color.blue;
++            pixel[1]=glyph->color.green;
++            pixel[2]=glyph->color.red;
++            pixel[3]=bitmap->data[(size_t)y*bitmap->header.stride+x];
++        }
++        if(!native_atlas_texture) {
++            native_atlas_texture=create_texture(native_atlas_size,native_atlas_size,NULL);
++            native_atlas_pages[native_atlas_page]=native_atlas_texture;
++        }
++        if(native_atlas_x+width+1>native_atlas_size) {
++            native_atlas_x=0; native_atlas_y+=native_atlas_row; native_atlas_row=0;
++        }
++        if(native_atlas_y+height+1>native_atlas_size) {
++            native_label_flush();
++            native_atlas_page=(native_atlas_page+1)%native_atlas_page_count;
++            unsigned int victim=native_atlas_pages[native_atlas_page];
++            for(unsigned i=0;i<4096;++i)
++                if(native_glyphs[i].texture==victim) native_glyphs[i].texture=0;
++            cached=&native_glyphs[first];
++            native_atlas_x=native_atlas_y=native_atlas_row=0;
++            if(native_atlas_page_count==1) {
++                glBindTexture(GL_TEXTURE_2D,native_atlas_texture);
++                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,native_atlas_size,native_atlas_size,
++                             0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
++            }
++            else {
++                if(victim) glDeleteTextures(1,&victim);
++                native_atlas_texture=create_texture(native_atlas_size,native_atlas_size,NULL);
++                native_atlas_pages[native_atlas_page]=native_atlas_texture;
++            }
++        }
++        if(!native_atlas_texture) { lv_free(pixels); native_label_supported=false; return; }
++        cached->x=native_atlas_x; cached->y=native_atlas_y;
++        glBindTexture(GL_TEXTURE_2D,native_atlas_texture);
++        glPixelStorei(GL_UNPACK_ALIGNMENT,1);
++        glTexSubImage2D(GL_TEXTURE_2D,0,cached->x,cached->y,width,height,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
++        cached->texture=native_atlas_texture;
++        native_atlas_x+=width+1;
++        native_atlas_row=LV_MAX(native_atlas_row,height+1);
++        lv_free(pixels);
++        cached->font=glyph->g->resolved_font; cached->font_generation=generation; cached->glyph=glyph->g->gid.index;
++        cached->color=color; cached->width=width; cached->height=height;
++    }
++    lv_layer_t * layer=t->target_layer;
++    lv_area_t clipped;
++    if(!lv_area_intersect(&clipped,glyph->letter_coords,&t->clip_area)) return;
++    int layer_width=lv_area_get_width(&layer->buf_area);
++    int layer_height=lv_area_get_height(&layer->buf_area);
++    float x1=2.f*(clipped.x1-layer->buf_area.x1)/layer_width-1.f;
++    float x2=2.f*(clipped.x2+1-layer->buf_area.x1)/layer_width-1.f;
++    float y1=2.f*(clipped.y1-layer->buf_area.y1)/layer_height-1.f;
++    float y2=2.f*(clipped.y2+1-layer->buf_area.y1)/layer_height-1.f;
++    float u1=(cached->x+clipped.x1-glyph->letter_coords->x1)/(float)native_atlas_size;
++    float u2=(cached->x+clipped.x2+1-glyph->letter_coords->x1)/(float)native_atlas_size;
++    float v1=(cached->y+clipped.y1-glyph->letter_coords->y1)/(float)native_atlas_size;
++    float v2=(cached->y+clipped.y2+1-glyph->letter_coords->y1)/(float)native_atlas_size;
++    if(native_vertex_count+6>1024*6 || (native_vertex_count && (native_batch_opa!=glyph->opa || native_batch_texture!=cached->texture))) native_label_flush();
++    native_batch_opa=glyph->opa;
++    native_batch_texture=cached->texture;
++    float vertices[24]={x1,y1,u1,v1, x2,y1,u2,v1, x2,y2,u2,v2,
++                        x1,y1,u1,v1, x2,y2,u2,v2, x1,y2,u1,v2};
++    lv_memcpy(native_vertices+native_vertex_count*4,vertices,sizeof(vertices));
++    native_vertex_count+=6;
++}
++
++static bool draw_native_label(lv_draw_task_t * t)
++{
++    if(t->type!=LV_DRAW_TASK_TYPE_LABEL) return false;
++    const lv_draw_label_dsc_t * label=t->draw_dsc;
++    if(label->rotation || label->decor || label->outline_stroke_width ||
++       label->sel_start!=LV_DRAW_LABEL_NO_TXT_SEL || label->sel_end!=LV_DRAW_LABEL_NO_TXT_SEL) return false;
++    native_label_supported=true;
++    native_label_checking=true;
++    lv_draw_label_iterate_characters(t,label,&t->area,native_label_glyph);
++    native_label_checking=false;
++    if(!native_label_supported) return false;
++    lv_draw_opengles_unit_t * unit=(lv_draw_opengles_unit_t *)t->draw_unit;
++    lv_layer_t * layer=t->target_layer;
++    unsigned int texture=layer_get_texture(layer);
++    if(!texture) return false;
++    unsigned int framebuffer=get_framebuffer(unit);
++    GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER,framebuffer));
++    GL_CALL(glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0));
++    lv_opengles_viewport(0,0,lv_area_get_width(&layer->buf_area),lv_area_get_height(&layer->buf_area));
++    native_batch_task=t;
++    native_vertex_count=0;
++    lv_draw_label_iterate_characters(t,label,&t->area,native_label_glyph);
++    native_label_flush();
++    return native_label_supported;
++}
++
++static GLuint native_line_program, native_line_vao, native_line_vbo;
++static GLint native_line_endpoints, native_line_colour, native_line_radius, native_line_caps;
++
++static void native_line_cleanup(void)
++{
++    if(native_line_vbo) glDeleteBuffers(1, &native_line_vbo);
++    if(native_line_vao) glDeleteVertexArrays(1, &native_line_vao);
++    if(native_line_program) glDeleteProgram(native_line_program);
++    native_line_program = native_line_vao = native_line_vbo = 0;
++}
++
++static bool native_line_init(void)
++{
++    if(native_line_program) return true;
++    const char * vertex =
++        "attribute highp vec2 position;\n"
++        "void main(){gl_Position=vec4(position,0.0,1.0);}\n";
++    const char * fragment =
++        "precision highp float;\n"
++        "uniform vec4 endpoints,colour;\n"
++        "uniform float radius;\n"
++        "uniform vec2 caps;\n"
++        "void main(){\n"
++        " vec2 delta=endpoints.zw-endpoints.xy;\n"
++        " vec2 point=gl_FragCoord.xy-endpoints.xy;\n"
++        " float raw=dot(point,delta)/max(dot(delta,delta),0.0001);\n"
++        " float t=clamp(raw,0.0,1.0);\n"
++        " float coverage=clamp(radius+0.5-length(point-delta*t),0.0,1.0);\n"
++        " if((raw<0.0 && caps.x<0.5)||(raw>1.0 && caps.y<0.5)) coverage=0.0;\n"
++        " gl_FragColor=colour*coverage;}\n";
++    GLuint vs = gpu_shadow_compile(GL_VERTEX_SHADER, vertex);
++    GLuint fs = gpu_shadow_compile(GL_FRAGMENT_SHADER, fragment);
++    if(!vs || !fs) {
++        if(vs) glDeleteShader(vs);
++        if(fs) glDeleteShader(fs);
++        return false;
++    }
++    native_line_program = glCreateProgram();
++    glAttachShader(native_line_program, vs);
++    glAttachShader(native_line_program, fs);
++    glBindAttribLocation(native_line_program, 0, "position");
++    glLinkProgram(native_line_program);
++    glDeleteShader(vs);
++    glDeleteShader(fs);
++    GLint ok = 0;
++    glGetProgramiv(native_line_program, GL_LINK_STATUS, &ok);
++    if(!ok) { native_line_cleanup(); return false; }
++    native_line_endpoints = glGetUniformLocation(native_line_program, "endpoints");
++    native_line_colour = glGetUniformLocation(native_line_program, "colour");
++    native_line_radius = glGetUniformLocation(native_line_program, "radius");
++    native_line_caps = glGetUniformLocation(native_line_program, "caps");
++    glGenVertexArrays(1, &native_line_vao);
++    glGenBuffers(1, &native_line_vbo);
++    glBindVertexArray(native_line_vao);
++    glBindBuffer(GL_ARRAY_BUFFER, native_line_vbo);
++    glEnableVertexAttribArray(0);
++    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), NULL);
++    return true;
++}
++
++static void native_line_segment(lv_draw_task_t * t, const lv_draw_line_dsc_t * line)
++{
++    lv_layer_t * layer = t->target_layer;
++    const float width = lv_area_get_width(&layer->buf_area);
++    const float height = lv_area_get_height(&layer->buf_area);
++    const float x1 = line->p1.x - layer->buf_area.x1 + 0.5f;
++    const float y1 = height - (line->p1.y - layer->buf_area.y1 + 0.5f);
++    const float x2 = line->p2.x - layer->buf_area.x1 + 0.5f;
++    const float y2 = height - (line->p2.y - layer->buf_area.y1 + 0.5f);
++    const float radius = line->width * 0.5f;
++    float dx=x2-x1, dy=y2-y1;
++    const float length=sqrtf(dx*dx+dy*dy);
++    if(length<=0.0001f) return;
++    dx/=length; dy/=length;
++    const float extent=radius+1.f;
++    const float px=-dy*extent, py=dx*extent;
++    const float start=line->round_start ? extent : 0.f;
++    const float end=line->round_end ? extent : 0.f;
++    const float corners[]={x1-dx*start+px,y1-dy*start+py,
++                            x2+dx*end+px,y2+dy*end+py,
++                            x2+dx*end-px,y2+dy*end-py,
++                            x1-dx*start-px,y1-dy*start-py};
++    const unsigned order[]={0,1,2,0,2,3};
++    float vertices[12];
++    for(unsigned i=0;i<6;++i) {
++        vertices[i*2]=2.f*corners[order[i]*2]/width-1.f;
++        vertices[i*2+1]=2.f*corners[order[i]*2+1]/height-1.f;
++    }
++    const float opacity = line->opa / 255.f;
++    glUniform4f(native_line_endpoints, x1,y1,x2,y2);
++    glUniform1f(native_line_radius, radius);
++    glUniform2f(native_line_caps, line->round_start, line->round_end);
++    glUniform4f(native_line_colour, line->color.blue / 255.f * opacity,
++                line->color.green / 255.f * opacity,
++                line->color.red / 255.f * opacity, opacity);
++    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STREAM_DRAW);
++    glDrawArrays(GL_TRIANGLES, 0, 6);
++}
++
++static bool draw_native_line(lv_draw_task_t * t)
++{
++    if(t->type != LV_DRAW_TASK_TYPE_LINE) return false;
++    lv_draw_line_dsc_t * line = t->draw_dsc;
++    if(line->width <= 0 || line->opa == LV_OPA_TRANSP) return true;
++    if(line->dash_width || line->dash_gap) return false;
++    lv_layer_t * layer = t->target_layer;
++    unsigned int texture = layer_get_texture(layer);
++    if(!texture) return false;
++    lv_area_t clip;
++    if(!lv_area_intersect(&clip, &t->clip_area, &layer->buf_area)) return true;
++    GLint old_program, old_vao, old_buffer;
++    glGetIntegerv(GL_CURRENT_PROGRAM, &old_program);
++    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
++    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_buffer);
++    bool ready = native_line_init();
++    if(ready) {
++        lv_draw_opengles_unit_t * unit = (lv_draw_opengles_unit_t *)t->draw_unit;
++        glBindFramebuffer(GL_FRAMEBUFFER, get_framebuffer(unit));
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
++        glViewport(0, 0, lv_area_get_width(&layer->buf_area), lv_area_get_height(&layer->buf_area));
++        glUseProgram(native_line_program);
++        glBindVertexArray(native_line_vao);
++        glBindBuffer(GL_ARRAY_BUFFER, native_line_vbo);
++        glEnable(GL_BLEND);
++        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++        glEnable(GL_SCISSOR_TEST);
++        glScissor(clip.x1-layer->buf_area.x1, layer->buf_area.y2-clip.y2,
++                  lv_area_get_width(&clip), lv_area_get_height(&clip));
++        lv_draw_line_iterate(t, line, native_line_segment);
++        glDisable(GL_SCISSOR_TEST);
++        glDisable(GL_BLEND);
++    }
++    glUseProgram(old_program);
++    glBindVertexArray(old_vao);
++    glBindBuffer(GL_ARRAY_BUFFER, old_buffer);
++    return ready;
++}
++
+ static void draw_from_cached_texture(lv_draw_task_t * t)
+ {
+     LV_PROFILER_DRAW_BEGIN;
+-    if(draw_streaming_image(t)) {
++    if(draw_native_line(t) || draw_native_label(t) || draw_solid_fill(t) || draw_streaming_image(t)) {
+         LV_PROFILER_DRAW_END;
+         return;
+     }
+@@ -703,6 +1453,7 @@ static void draw_from_cached_texture(lv_draw_task_t * t)
+ #endif
+     data_to_find.w = lv_area_get_width(&t->_real_area);
+     data_to_find.h = lv_area_get_height(&t->_real_area);
++    data_to_find.task_type = t->type;
+     data_to_find.text_hash = 0;
+     data_to_find.texture = 0;
+ 
+@@ -710,6 +1461,7 @@ static void draw_from_cached_texture(lv_draw_task_t * t)
+         const lv_draw_label_dsc_t * label_dsc =
+             &data_to_find.draw_dsc.label;
+         data_to_find.text_hash = opengles_text_hash(label_dsc->text);
++        data_to_find.draw_dsc.label.hint = NULL;
+     }
+ 
+     /* user_data stores the renderer to differentiate it from SW rendered
+@@ -722,12 +1474,50 @@ static void draw_from_cached_texture(lv_draw_task_t * t)
+     lv_area_t original_area = t->area;
+     lv_area_t original_real_area = t->_real_area;
+     bool gpu_scaled_image = false;
++    lv_opa_t primitive_opa = LV_OPA_COVER;
++    switch(t->type) {
++        case LV_DRAW_TASK_TYPE_FILL:
++            primitive_opa = data_to_find.draw_dsc.fill.opa;
++            data_to_find.draw_dsc.fill.opa = LV_OPA_COVER;
++            break;
++        case LV_DRAW_TASK_TYPE_BORDER:
++            primitive_opa = data_to_find.draw_dsc.border.opa;
++            data_to_find.draw_dsc.border.opa = LV_OPA_COVER;
++            break;
++        case LV_DRAW_TASK_TYPE_BOX_SHADOW:
++            primitive_opa = data_to_find.draw_dsc.box_shadow.opa;
++            data_to_find.draw_dsc.box_shadow.opa = LV_OPA_COVER;
++            break;
++        case LV_DRAW_TASK_TYPE_LABEL:
++            primitive_opa = data_to_find.draw_dsc.label.opa;
++            data_to_find.draw_dsc.label.opa = LV_OPA_COVER;
++            break;
++        case LV_DRAW_TASK_TYPE_ARC:
++            primitive_opa = data_to_find.draw_dsc.arc.opa;
++            data_to_find.draw_dsc.arc.opa = LV_OPA_COVER;
++            break;
++        case LV_DRAW_TASK_TYPE_LINE:
++            primitive_opa = data_to_find.draw_dsc.line.opa;
++            data_to_find.draw_dsc.line.opa = LV_OPA_COVER;
++            break;
++        case LV_DRAW_TASK_TYPE_TRIANGLE:
++            primitive_opa = data_to_find.draw_dsc.triangle.opa;
++            data_to_find.draw_dsc.triangle.opa = LV_OPA_COVER;
++            break;
++        default: break;
++    }
+     if(t->type == LV_DRAW_TASK_TYPE_IMAGE) {
+         lv_draw_image_dsc_t * img_dsc = &data_to_find.draw_dsc.image;
+-        if(lv_image_src_get_type(img_dsc->src) == LV_IMAGE_SRC_VARIABLE &&
++        lv_image_src_t source_type = lv_image_src_get_type(img_dsc->src);
++        if((source_type == LV_IMAGE_SRC_VARIABLE || source_type == LV_IMAGE_SRC_FILE) &&
+            img_dsc->rotation == 0 && img_dsc->skew_x == 0 && img_dsc->skew_y == 0 &&
+            !img_dsc->tile && img_dsc->clip_radius == 0 && img_dsc->bitmap_mask_src == NULL) {
++            lv_image_dsc_t file_image_header = {0};
+             const lv_image_dsc_t * image = (const lv_image_dsc_t *)img_dsc->src;
++            if(source_type == LV_IMAGE_SRC_FILE) {
++                image = lv_image_decoder_get_info(img_dsc->src, &file_image_header.header) == LV_RESULT_OK
++                    ? &file_image_header : NULL;
++            }
+             if(image != NULL && image->header.magic == LV_IMAGE_HEADER_MAGIC &&
+                image->header.w > 0 && image->header.h > 0) {
+                 /* Cache one source-sized, recolored texture. Scale and opacity
+@@ -817,7 +1607,7 @@ static void draw_from_cached_texture(lv_draw_task_t * t)
+     lv_area_move(&clip_area, -dest_layer->buf_area.x1, -dest_layer->buf_area.y1);
+     lv_area_t render_area = t->_real_area;
+     lv_area_move(&render_area, -dest_layer->buf_area.x1, -dest_layer->buf_area.y1);
+-    lv_opa_t render_opa = LV_OPA_COVER;
++    lv_opa_t render_opa = primitive_opa;
+     if(gpu_scaled_image && t->type == LV_DRAW_TASK_TYPE_IMAGE)
+         render_opa = ((lv_draw_image_dsc_t *)live_draw_dsc)->opa;
+     const lv_draw_image_dsc_t * live_image_dsc =
+@@ -841,7 +1631,6 @@ static void draw_from_cached_texture(lv_draw_task_t * t)
+     }
+ 
+     if(target_texture) {
+-        GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+     }
+ 
+     lv_cache_release(u->texture_cache, entry_cached, u);
+@@ -864,11 +1653,69 @@ static void draw_from_cached_texture(lv_draw_task_t * t)
+     LV_PROFILER_DRAW_END;
+ }
+ 
++static void mask_clear_strip(const lv_area_t * area, int32_t height)
++{
++    if(area->x1 > area->x2 || area->y1 > area->y2) return;
++    glScissor(area->x1, height - area->y2 - 1, lv_area_get_width(area), lv_area_get_height(area));
++    glClear(GL_COLOR_BUFFER_BIT);
++}
++
++static bool draw_rectangle_mask(lv_draw_task_t * t)
++{
++    if(t->type != LV_DRAW_TASK_TYPE_MASK_RECTANGLE) return false;
++    const lv_draw_mask_rect_dsc_t * mask = t->draw_dsc;
++    lv_draw_opengles_unit_t * unit = (lv_draw_opengles_unit_t *)t->draw_unit;
++    lv_layer_t * layer = t->target_layer;
++    unsigned int texture = layer_get_texture(layer);
++    if(!texture) return false;
++    lv_area_t clip;
++    if(!lv_area_intersect(&clip, &t->clip_area, &layer->buf_area)) return true;
++    lv_area_t area = mask->area;
++    lv_area_move(&area, -layer->buf_area.x1, -layer->buf_area.y1);
++    lv_area_move(&clip, -layer->buf_area.x1, -layer->buf_area.y1);
++    int32_t width = lv_area_get_width(&layer->buf_area);
++    int32_t height = lv_area_get_height(&layer->buf_area);
++    unsigned int framebuffer = get_framebuffer(unit);
++    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
++    lv_opengles_viewport(0, 0, width, height);
++    if(!mask->keep_outside) {
++        glEnable(GL_SCISSOR_TEST);
++        glClearColor(0,0,0,0);
++        lv_area_t strip = {clip.x1, clip.y1, clip.x2, LV_MIN(clip.y2,area.y1-1)};
++        mask_clear_strip(&strip,height);
++        strip = (lv_area_t){clip.x1,LV_MAX(clip.y1,area.y2+1),clip.x2,clip.y2};
++        mask_clear_strip(&strip,height);
++        int32_t top = LV_MAX(clip.y1,area.y1);
++        int32_t bottom = LV_MIN(clip.y2,area.y2);
++        strip = (lv_area_t){clip.x1,top,LV_MIN(clip.x2,area.x1-1),bottom};
++        mask_clear_strip(&strip,height);
++        strip = (lv_area_t){LV_MAX(clip.x1,area.x2+1),top,clip.x2,bottom};
++        mask_clear_strip(&strip,height);
++        glDisable(GL_SCISSOR_TEST);
++    }
++    if(lv_area_get_width(&area)>0 && lv_area_get_height(&area)>0) {
++        lv_opengles_render_params_t params;
++        lv_opengles_render_params_init(&params);
++        params.texture_area = &area;
++        params.texture_clip_area = &clip;
++        params.disp_w = width;
++        params.disp_h = height;
++        params.opa = LV_OPA_COVER;
++        params.fill_color = lv_color_white();
++        params.blur_corner_radius = LV_MAX(0, LV_MIN(mask->radius, LV_MIN(lv_area_get_width(&area),lv_area_get_height(&area))/2));
++        params.alpha_mask = true;
++        lv_opengles_render(&params);
++    }
++    return true;
++}
++
+ static void execute_drawing(lv_draw_opengles_unit_t * u)
+ {
+     lv_draw_task_t * t = u->task_act;
+     t->draw_unit = (lv_draw_unit_t *)u;
+ 
++    if(draw_rectangle_mask(t)) return;
+     if(draw_backdrop_blur(u, t)) return;
+ 
+     /* the shader-based fill is not working reliably with EGL. */
+@@ -908,7 +1755,6 @@ static void execute_drawing(lv_draw_opengles_unit_t * u)
+             }
+ 
+             if(target_texture) {
+-                GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+             }
+ 
+             return;
+@@ -1011,7 +1857,6 @@ static void lv_draw_opengles_3d(lv_draw_task_t * t, const lv_draw_3d_dsc_t * dsc
+     lv_opengles_render(&params);
+ 
+     if(target_texture) {
+-        GL_CALL(glBindFramebuffer(GL_FRAMEBUFFER, 0));
+     }
+     LV_PROFILER_DRAW_END;
+ }
+diff --git a/src/drivers/opengles/assets/lv_opengles_shader.c b/src/drivers/opengles/assets/lv_opengles_shader.c
+index 4707f0d..419763c 100644
+--- a/src/drivers/opengles/assets/lv_opengles_shader.c
++++ b/src/drivers/opengles/assets/lv_opengles_shader.c
+@@ -61,24 +61,27 @@ static const lv_opengl_shader_t src_includes_v100[] = {{
+ static const char * src_vertex_shader_v100 = R"(
+     precision mediump float;
+     
+-    attribute vec4 position;
++    attribute highp vec4 position;
+     attribute vec2 texCoord;
+     
+-    varying vec2 v_TexCoord;
++    varying mediump vec2 v_TexCoord;
++    varying highp vec2 v_ShapeCoord;
+     
+-    uniform mat3 u_VertexTransform;
++    uniform highp mat3 u_VertexTransform;
+     
+     void main()
+     {
+         gl_Position = vec4((u_VertexTransform * vec3(position.xy, 1.0)).xy, position.zw);
+         v_TexCoord = texCoord;
++        v_ShapeCoord = texCoord;
+     }
+ )";
+ 
+ static const char *src_fragment_shader_v100 = R"(
+     precision lowp float;
+     
+-    varying vec2 v_TexCoord;
++    varying mediump vec2 v_TexCoord;
++    varying highp vec2 v_ShapeCoord;
+     
+     uniform sampler2D u_Texture;
+     uniform float u_ColorDepth;
+@@ -86,15 +89,55 @@ static const char *src_fragment_shader_v100 = R"(
+     uniform bool u_IsFill;
+     uniform vec3 u_FillColor;
+     uniform bool u_SwapRB;
++    uniform bool u_Premultiplied;
+     uniform bool u_IsBlur;
+     uniform vec3 u_BlurParams;
+-    uniform vec3 u_BlurShape;
++    uniform highp vec3 u_BlurShape;
++    uniform highp float u_ShapeBorderWidth;
++    uniform highp vec3 u_GradientColor0;
++    uniform highp vec3 u_GradientColor1;
++    uniform highp vec3 u_GradientRange;
++    uniform highp vec3 u_GradientInfo;
+     uniform vec3 u_BlurDirection;
+     
+     #ifdef HSV_ADJUST
+ #include <hsv_adjust.glsl>
+     #endif
+     
++    highp float shapeCoverage(highp vec2 point, highp vec2 halfSize, highp float radius)
++    {
++        highp vec2 q = abs(point) - halfSize + vec2(radius);
++        highp float distance = max(q.x, q.y) - radius;
++        if(min(q.x, q.y) > 0.0) distance = length(q) - radius;
++        return clamp(0.5 - distance, 0.0, 1.0);
++    }
++
++    highp vec4 gradientColor()
++    {
++        highp vec2 pixel = v_ShapeCoord * u_BlurShape.xy - vec2(0.5);
++        highp float position = u_GradientInfo.x < 1.5 ? pixel.y : pixel.x;
++        highp float fraction = clamp((position - u_GradientRange.x) / (u_GradientRange.y - u_GradientRange.x), 0.0, 1.0);
++        highp float alpha = mix(u_GradientInfo.y, u_GradientInfo.z, fraction) * u_Opa;
++        return vec4(mix(u_GradientColor0, u_GradientColor1, fraction) * alpha, alpha);
++    }
++
++    #ifdef AERA_TEXTURE_SHADER
++    void main()
++    {
++        gl_FragColor = texture2D(u_Texture, v_TexCoord);
++        if (abs(u_ColorDepth - 8.0) < 0.1) {
++            gl_FragColor.r *= u_Opa;
++            gl_FragColor.gba = vec3(gl_FragColor.rr, u_Opa);
++        } else {
++            gl_FragColor.a *= u_Opa;
++            gl_FragColor.rgb *= u_Premultiplied ? u_Opa : gl_FragColor.a;
++        }
++        if (u_SwapRB) gl_FragColor.bgr = gl_FragColor.rgb;
++        #ifdef HSV_ADJUST
++        gl_FragColor.rgb = adjustHSV(gl_FragColor.rgb);
++        #endif
++    }
++    #else
+     void main()
+     {
+         vec4 texColor;
+@@ -117,22 +160,30 @@ static const char *src_fragment_shader_v100 = R"(
+             gl_FragColor = vec4(vec3(gray * u_Opa), u_Opa);
+         } else {
+             float combinedAlpha = texColor.a * u_Opa;
+-            gl_FragColor = vec4(texColor.rgb * combinedAlpha, combinedAlpha);
++            gl_FragColor = vec4(texColor.rgb * (u_Premultiplied ? u_Opa : combinedAlpha), combinedAlpha);
+         }
++        if ((u_IsFill) && u_GradientInfo.x > 0.5) gl_FragColor = gradientColor();
+         if (u_SwapRB) {
+             gl_FragColor.bgr = gl_FragColor.rgb;
+         }
+-        if (u_IsBlur && u_BlurShape.z > 0.0) {
+-            vec2 halfSize = u_BlurShape.xy * 0.5;
+-            vec2 point = abs(v_TexCoord * u_BlurShape.xy - halfSize);
+-            vec2 edge = halfSize - vec2(u_BlurShape.z);
+-            float distanceToCorner = length(max(point - edge, vec2(0.0))) - u_BlurShape.z;
+-            gl_FragColor *= 1.0 - smoothstep(-1.0, 1.0, distanceToCorner);
++        if ((u_IsBlur || u_IsFill) && (u_BlurShape.z > 0.0 || u_ShapeBorderWidth > 0.0)) {
++            highp vec2 halfSize = u_BlurShape.xy * 0.5;
++            highp vec2 point = v_ShapeCoord * u_BlurShape.xy - halfSize;
++            highp float coverage = shapeCoverage(point, halfSize, u_BlurShape.z);
++            if (u_ShapeBorderWidth > 0.0) {
++                highp vec2 innerSize = halfSize - vec2(u_ShapeBorderWidth);
++                if (min(innerSize.x, innerSize.y) > 0.0) {
++                    highp float innerRadius = max(u_BlurShape.z - u_ShapeBorderWidth, 0.0);
++                    coverage -= shapeCoverage(point, innerSize, innerRadius);
++                }
++            }
++            gl_FragColor *= clamp(coverage, 0.0, 1.0);
+         }
+         #ifdef HSV_ADJUST
+         gl_FragColor.rgb = adjustHSV(gl_FragColor.rgb);
+         #endif
+     }
++    #endif
+ )";
+ 
+ static const lv_opengl_shader_t src_includes_v300es[] = {{
+@@ -190,23 +241,25 @@ static const lv_opengl_shader_t src_includes_v300es[] = {{
+ static const char * src_vertex_shader_v300es = R"(
+     precision mediump float;
+     
+-    in vec4 position;
++    in highp vec4 position;
+     in vec2 texCoord;
+     
+-    out vec2 v_TexCoord;
++    out mediump vec2 v_TexCoord;
++    out highp vec2 v_ShapeCoord;
+     flat out lowp vec4 fill_color_alpha;
+     flat out lowp int is_gray;
+ 
+     uniform lowp float u_Opa;
+     uniform bool u_IsFill;
+     uniform vec3 u_FillColor;
+-    uniform mat3 u_VertexTransform;
++    uniform highp mat3 u_VertexTransform;
+     uniform float u_ColorDepth;
+     
+     void main()
+     {
+         gl_Position = vec4((u_VertexTransform * vec3(position.xy, 1)).xy, position.zw);
+         v_TexCoord = texCoord;
++        v_ShapeCoord = texCoord;
+         is_gray = (abs(u_ColorDepth - 8.0) < 0.1) ? 1 : 0;
+ 
+         if (u_IsFill) {
+@@ -226,22 +279,63 @@ static const char *src_fragment_shader_v300es = R"(
+     
+     out vec4 color;
+     
+-    in vec2 v_TexCoord;
++    in mediump vec2 v_TexCoord;
++    in highp vec2 v_ShapeCoord;
+     flat in lowp vec4 fill_color_alpha;
+     flat in lowp int is_gray;
+     
+     uniform sampler2D u_Texture;
+     uniform lowp float u_Opa;
+     uniform bool u_SwapRB;
++    uniform bool u_Premultiplied;
+     uniform bool u_IsBlur;
+     uniform mediump vec3 u_BlurParams;
+-    uniform mediump vec3 u_BlurShape;
++    uniform highp vec3 u_BlurShape;
++    uniform highp float u_ShapeBorderWidth;
++    uniform highp vec3 u_GradientColor0;
++    uniform highp vec3 u_GradientColor1;
++    uniform highp vec3 u_GradientRange;
++    uniform highp vec3 u_GradientInfo;
+     uniform mediump vec3 u_BlurDirection;
+     
+     #ifdef HSV_ADJUST
+ #include <hsv_adjust.glsl>
+     #endif
+ 
++    highp float shapeCoverage(highp vec2 point, highp vec2 halfSize, highp float radius)
++    {
++        highp vec2 q = abs(point) - halfSize + vec2(radius);
++        highp float distance = max(q.x, q.y) - radius;
++        if(min(q.x, q.y) > 0.0) distance = length(q) - radius;
++        return clamp(0.5 - distance, 0.0, 1.0);
++    }
++
++    highp vec4 gradientColor()
++    {
++        highp vec2 pixel = v_ShapeCoord * u_BlurShape.xy - vec2(0.5);
++        highp float position = u_GradientInfo.x < 1.5 ? pixel.y : pixel.x;
++        highp float fraction = clamp((position - u_GradientRange.x) / (u_GradientRange.y - u_GradientRange.x), 0.0, 1.0);
++        highp float alpha = mix(u_GradientInfo.y, u_GradientInfo.z, fraction) * u_Opa;
++        return vec4(mix(u_GradientColor0, u_GradientColor1, fraction) * alpha, alpha);
++    }
++
++    #ifdef AERA_TEXTURE_SHADER
++    void main()
++    {
++        color = texture(u_Texture, v_TexCoord);
++        if (is_gray != 0) {
++            color.r *= u_Opa;
++            color.gba = vec3(color.rr, u_Opa);
++        } else {
++            color.a *= u_Opa;
++            color.rgb *= u_Premultiplied ? u_Opa : color.a;
++        }
++        if (u_SwapRB) color.bgr = color.rgb;
++        #ifdef HSV_ADJUST
++        color.rgb = adjustHSV(color.rgb);
++        #endif
++    }
++    #else
+     void main()
+     {
+         if (fill_color_alpha.a != -1.0) {
+@@ -267,23 +361,31 @@ static const char *src_fragment_shader_v300es = R"(
+                 color.gba = vec3(color.rr, u_Opa);
+             } else {
+                 color.a *= u_Opa;
+-                color.rgb *= color.a;
++                color.rgb *= u_Premultiplied ? u_Opa : color.a;
+             }
+         }
++        if ((fill_color_alpha.a != -1.0) && u_GradientInfo.x > 0.5) color = gradientColor();
+         if (u_SwapRB) {
+             color.bgr = color.rgb;
+         }
+-        if (u_IsBlur && u_BlurShape.z > 0.0) {
+-            mediump vec2 halfSize = u_BlurShape.xy * 0.5;
+-            mediump vec2 point = abs(v_TexCoord * u_BlurShape.xy - halfSize);
+-            mediump vec2 edge = halfSize - vec2(u_BlurShape.z);
+-            mediump float distanceToCorner = length(max(point - edge, vec2(0.0))) - u_BlurShape.z;
+-            color *= 1.0 - smoothstep(-1.0, 1.0, distanceToCorner);
++        if ((u_IsBlur || fill_color_alpha.a != -1.0) && (u_BlurShape.z > 0.0 || u_ShapeBorderWidth > 0.0)) {
++            highp vec2 halfSize = u_BlurShape.xy * 0.5;
++            highp vec2 point = v_ShapeCoord * u_BlurShape.xy - halfSize;
++            highp float coverage = shapeCoverage(point, halfSize, u_BlurShape.z);
++            if (u_ShapeBorderWidth > 0.0) {
++                highp vec2 innerSize = halfSize - vec2(u_ShapeBorderWidth);
++                if (min(innerSize.x, innerSize.y) > 0.0) {
++                    highp float innerRadius = max(u_BlurShape.z - u_ShapeBorderWidth, 0.0);
++                    coverage -= shapeCoverage(point, innerSize, innerRadius);
++                }
++            }
++            color *= clamp(coverage, 0.0, 1.0);
+         }
+         #ifdef HSV_ADJUST
+         color.rgb = adjustHSV(color.rgb);
+         #endif
+     }
++    #endif
+ )";
+ 
+ static const size_t src_includes_v100_count = sizeof src_includes_v100 / sizeof src_includes_v100[0];
+diff --git a/src/drivers/opengles/lv_opengles_driver.c b/src/drivers/opengles/lv_opengles_driver.c
+index db1e754..62c8775 100644
+--- a/src/drivers/opengles/lv_opengles_driver.c
++++ b/src/drivers/opengles/lv_opengles_driver.c
+@@ -8,6 +8,7 @@
+  *********************/
+ 
+ #include "lv_opengles_driver.h"
++#include <string.h>
+ #if LV_USE_OPENGLES
+ 
+ #include "../../misc/lv_types.h"
+@@ -77,7 +78,10 @@ static void populate_vertex_buffer(float vertex_buffer[LV_OPENGLES_VERTEX_BUFFER
+  **********************/
+ static bool is_init;
+ 
+-static lv_opengl_shader_manager_t shader_manager;
++static lv_opengl_shader_manager_t shader_managers[2];
++static unsigned int shader_variant;
++static bool use_texture_shader;
++#define shader_manager shader_managers[shader_variant]
+ 
+ static unsigned int vertex_buffer_id = 0;
+ 
+@@ -86,10 +90,12 @@ static unsigned int vertex_array_id = 0;
+ static unsigned int index_buffer_id = 0;
+ static unsigned int index_buffer_count = 0;
+ 
+-static unsigned int shader_id;
++static unsigned int shader_ids[2];
++#define shader_id shader_ids[shader_variant]
+ 
+-static const char * shader_names[] = { "u_Texture", "u_ColorDepth", "u_VertexTransform", "u_Opa", "u_IsFill", "u_FillColor", "u_SwapRB", "u_Hue", "u_Saturation", "u_Value", "u_IsBlur", "u_BlurParams", "u_BlurShape", "u_BlurDirection" };
+-static int shader_location[sizeof(shader_names) / sizeof(shader_names[0])];
++static const char * shader_names[] = { "u_Texture", "u_ColorDepth", "u_VertexTransform", "u_Opa", "u_IsFill", "u_FillColor", "u_SwapRB", "u_Hue", "u_Saturation", "u_Value", "u_IsBlur", "u_BlurParams", "u_BlurShape", "u_BlurDirection", "u_ShapeBorderWidth", "u_GradientColor0", "u_GradientColor1", "u_GradientRange", "u_GradientInfo", "u_Premultiplied" };
++static int shader_locations[2][sizeof(shader_names) / sizeof(shader_names[0])];
++#define shader_location shader_locations[shader_variant]
+ 
+ /**********************
+  *      MACROS
+@@ -119,6 +125,14 @@ void lv_opengles_init(void)
+ 
+     lv_result_t res = lv_opengles_shader_init();
+     LV_ASSERT_MSG(res == LV_RESULT_OK, "Failed to initialize shaders");
++    const char * renderer = (const char *)glGetString(GL_RENDERER);
++    use_texture_shader = renderer && strstr(renderer, "Mali");
++    if(use_texture_shader) {
++        shader_variant=1;
++        use_texture_shader=lv_opengles_shader_init()==LV_RESULT_OK;
++        shader_variant=0;
++    }
++
+ 
+     lv_opengles_shader_bind();
+ 
+@@ -139,7 +153,10 @@ void lv_opengles_deinit(void)
+ {
+     if(!is_init) return;
+ 
+-    lv_opengles_shader_deinit();
++    for(shader_variant=0;shader_variant<2;++shader_variant) lv_opengles_shader_deinit();
++    shader_variant=0;
++    use_texture_shader=false;
++    lv_memzero(shader_locations,sizeof(shader_locations));
+     lv_opengles_index_buffer_deinit();
+     lv_opengles_vertex_buffer_deinit();
+     lv_opengles_vertex_array_deinit();
+@@ -213,6 +230,7 @@ void lv_opengles_render_blur_texture(unsigned int texture, const lv_area_t * are
+      * unlike LVGL's top-first image uploads. Flip only copied backdrop
+      * textures so an invalidated dock never flashes vertically mirrored. */
+     params.v_flip = true;
++    params.premultiplied_texture = true;
+     params.blur_radius = blur_radius;
+     params.blur_corner_radius = corner_radius;
+     params.blur_direction_x = direction_x;
+@@ -285,6 +303,7 @@ void lv_opengles_render_display(lv_display_t * display, const lv_opengles_render
+         hor_translate, ver_translate, 1.0f
+     };
+ 
++    shader_variant=use_texture_shader ? 1 : 0;
+     lv_opengles_shader_bind();
+     lv_opengles_shader_set_uniform1f("u_ColorDepth", LV_COLOR_DEPTH);
+     lv_opengles_shader_set_uniform1i("u_Texture", 0);
+@@ -293,6 +312,7 @@ void lv_opengles_render_display(lv_display_t * display, const lv_opengles_render
+     lv_opengles_shader_set_uniform1i("u_IsFill", 0);
+     lv_opengles_shader_set_uniform3f("u_FillColor", 1.0f, 1.0f, 1.0f);
+     lv_opengles_shader_set_uniform1i("u_SwapRB", params->rb_swap);
++    lv_opengles_shader_set_uniform1i("u_Premultiplied", 1);
+     /* The display presentation path uses the shared shader directly rather
+      * than lv_opengles_render().  Do not let a backdrop blur from the final
+      * LVGL draw task leak into the full-screen composition for one frame. */
+@@ -408,12 +428,19 @@ void lv_opengles_render(const lv_opengles_render_params_t * params)
+     hor_scale = params->h_flip ? -hor_scale : hor_scale;
+     ver_scale = params->v_flip ? ver_scale : -ver_scale;
+ 
+-    if(params->texture != 0) {
+-        float clip_x1;
+-        float clip_x2;
+-        float clip_y1;
+-        float clip_y2;
+-        if(params->use_precise_area) {
++    {
++        float clip_x1 = 0.f;
++        float clip_x2 = 1.f;
++        float clip_y1 = 0.f;
++        float clip_y2 = 1.f;
++        if(params->texture == 0) {
++            /* Clipping changes the quad, not the original shape geometry. */
++            clip_x1 = (intersection.x1 - params->texture_area->x1) / (float)lv_area_get_width(params->texture_area);
++            clip_x2 = (intersection.x2 + 1 - params->texture_area->x1) / (float)lv_area_get_width(params->texture_area);
++            clip_y1 = (intersection.y1 - params->texture_area->y1) / (float)lv_area_get_height(params->texture_area);
++            clip_y2 = (intersection.y2 + 1 - params->texture_area->y1) / (float)lv_area_get_height(params->texture_area);
++        }
++        else if(params->use_precise_area) {
+             clip_x1 = (precise_x1 - params->precise_x) / params->precise_w;
+             clip_x2 = (precise_x2 - params->precise_x) / params->precise_w;
+             clip_y1 = (precise_y1 - params->precise_y) / params->precise_h;
+@@ -495,8 +522,10 @@ void lv_opengles_render(const lv_opengles_render_params_t * params)
+     lv_matrix_t gl_matrix;
+     lv_matrix_transpose(&matrix, &gl_matrix);
+ 
++    shader_variant=use_texture_shader && params->texture && params->blur_radius<=0.f ? 1 : 0;
+     lv_opengles_shader_bind();
+     lv_opengles_enable_blending(params->blend_opt);
++    if(params->alpha_mask) GL_CALL(glBlendFunc(GL_ZERO, GL_SRC_ALPHA));
+     lv_opengles_shader_set_uniform1f("u_ColorDepth", LV_COLOR_DEPTH);
+     lv_opengles_shader_set_uniform1i("u_Texture", 0);
+     lv_opengles_shader_set_uniformmatrix3fv("u_VertexTransform", 1, (float *)&gl_matrix);
+@@ -506,7 +535,18 @@ void lv_opengles_render(const lv_opengles_render_params_t * params)
+                                      (float)params->fill_color.green / 255.0f,
+                                      (float)params->fill_color.blue / 255.0f);
+     lv_opengles_shader_set_uniform1i("u_SwapRB", params->rb_swap ? 1 : 0);
++    lv_opengles_shader_set_uniform1i("u_Premultiplied", params->premultiplied_texture);
+     lv_opengles_shader_set_uniform1i("u_IsBlur", params->blur_radius > 0.f ? 1 : 0);
++    lv_opengles_shader_set_uniform1f("u_ShapeBorderWidth", params->shape_border_width);
++    lv_opengles_shader_set_uniform3f("u_GradientInfo", params->shape_gradient_dir,
++                                   params->shape_gradient_opacity[0], params->shape_gradient_opacity[1]);
++    if(params->shape_gradient_dir) {
++        lv_color_t first = params->shape_gradient_colors[0];
++        lv_color_t last = params->shape_gradient_colors[1];
++        lv_opengles_shader_set_uniform3f("u_GradientColor0", first.red / 255.f, first.green / 255.f, first.blue / 255.f);
++        lv_opengles_shader_set_uniform3f("u_GradientColor1", last.red / 255.f, last.green / 255.f, last.blue / 255.f);
++        lv_opengles_shader_set_uniform3f("u_GradientRange", params->shape_gradient_stops[0], params->shape_gradient_stops[1], 0.f);
++    }
+     lv_opengles_shader_set_uniform3f("u_BlurParams", params->blur_radius,
+                                      params->texture_area == NULL ? 1.f : (float)lv_area_get_width(params->texture_area),
+                                      params->texture_area == NULL ? 1.f : (float)lv_area_get_height(params->texture_area));
+@@ -518,7 +558,14 @@ void lv_opengles_render(const lv_opengles_render_params_t * params)
+                                      params->blur_direction_x,
+                                      params->blur_direction_y, 0.f);
+ 
+-    lv_opengles_render_draw();
++    if(params->batch_vertices && params->batch_vertex_count) {
++        lv_opengles_vertex_buffer_init(params->batch_vertices,params->batch_vertex_count*4*sizeof(float));
++        lv_opengles_shader_bind();
++        lv_opengles_vertex_array_bind();
++        GL_CALL(glDrawArrays(GL_TRIANGLES,0,params->batch_vertex_count));
++    } else {
++        lv_opengles_render_draw();
++    }
+     lv_opengles_disable_blending();
+     LV_PROFILER_DRAW_END;
+ }
+@@ -639,6 +686,17 @@ static unsigned int lv_opengles_shader_manager_init(void)
+             lv_opengles_shader_get_source(&portions, version);
+             char * vertex_shader = lv_opengles_shader_get_vertex(version);
+             char * frag_shader = lv_opengles_shader_get_fragment(version);
++            if(shader_variant==1) {
++                const char * define="#define AERA_TEXTURE_SHADER\n";
++                size_t length=strlen(define)+strlen(frag_shader)+1;
++                char * specialized=lv_malloc(length);
++                if(!specialized) { lv_free(vertex_shader); lv_free(frag_shader); return 0; }
++                strcpy(specialized,define);
++                strcat(specialized,frag_shader);
++                lv_free(frag_shader);
++                frag_shader=specialized;
++            }
++
+             lv_opengl_shader_manager_init(&shader_manager, portions.all, portions.count, vertex_shader, frag_shader);
+             lv_free(vertex_shader);
+             lv_free(frag_shader);
+@@ -691,21 +749,22 @@ static int lv_opengles_shader_get_uniform_location(const char * name)
+     for(size_t i = 0; i < sizeof(shader_location) / sizeof(int); i++) {
+         if(lv_strcmp(shader_names[i], name) == 0) {
+             id = i;
++            break;
+         }
+     }
+ 
+     LV_ASSERT_FORMAT_MSG(id > -1, "Uniform location doesn't exist for '%s'. Check `shader_location` array", name);
+ 
+     if(shader_location[id] != 0) {
+-        return shader_location[id];
++        return shader_location[id] - 2;
+     }
+ 
+     int location;
+     GL_CALL(location = glGetUniformLocation(shader_id, name));
+-    if(location == -1)
++    if(location == -1 && shader_variant == 0)
+         LV_LOG_WARN("Warning: uniform '%s' doesn't exist!", name);
+ 
+-    shader_location[id] = location;
++    shader_location[id] = location + 2;
+     return location;
+ }
+ 
+diff --git a/src/drivers/opengles/lv_opengles_private.h b/src/drivers/opengles/lv_opengles_private.h
+index 08a0c9d..636514d 100644
+--- a/src/drivers/opengles/lv_opengles_private.h
++++ b/src/drivers/opengles/lv_opengles_private.h
+@@ -115,6 +115,8 @@ extern "C" {
+  **********************/
+ 
+ typedef struct {
++    const float * batch_vertices;
++    unsigned int batch_vertex_count;
+     unsigned int texture;
+     const lv_area_t * texture_area;
+     float precise_x;
+@@ -130,8 +132,15 @@ typedef struct {
+     bool v_flip;
+     bool rb_swap;
+     lv_color_t fill_color;
++    bool premultiplied_texture;
++    bool alpha_mask;
+     bool blend_opt;
+     float blur_radius;
++    int shape_gradient_dir;
++    lv_color_t shape_gradient_colors[2];
++    float shape_gradient_stops[2];
++    float shape_gradient_opacity[2];
++    float shape_border_width;
+     float blur_corner_radius;
+     float blur_direction_x;
+     float blur_direction_y;
+diff --git a/src/libs/freetype/lv_freetype.c b/src/libs/freetype/lv_freetype.c
+index ac348b0..342555d 100644
+--- a/src/libs/freetype/lv_freetype.c
++++ b/src/libs/freetype/lv_freetype.c
+@@ -60,6 +60,8 @@ static void freetype_font_free_src_cb(void * src);
+  *  STATIC VARIABLES
+  **********************/
+ 
++static uint64_t font_cache_sequence;
++
+ const lv_font_class_t lv_freetype_font_class = {
+     .create_cb = freetype_font_create_cb,
+     .delete_cb = freetype_font_delete_cb,
+@@ -183,6 +185,7 @@ lv_font_t * lv_freetype_font_create_with_info(const lv_font_info_t * font_info)
+     dsc->style = font_info->style;
+     dsc->kerning = font_info->kerning;
+     dsc->magic_num = LV_FREETYPE_FONT_DSC_MAGIC_NUM;
++    dsc->cache_id = __atomic_add_fetch(&font_cache_sequence, 1, __ATOMIC_RELAXED);
+     dsc->cache_node = lv_cache_entry_get_data(cache_node_entry);
+     dsc->cache_node_entry = cache_node_entry;
+ 
+diff --git a/src/libs/freetype/lv_freetype.h b/src/libs/freetype/lv_freetype.h
+index 98837e5..9b88c1b 100644
+--- a/src/libs/freetype/lv_freetype.h
++++ b/src/libs/freetype/lv_freetype.h
+@@ -111,6 +111,10 @@ lv_font_t * lv_freetype_font_create(const char * pathname, lv_freetype_font_rend
+  */
+ void lv_freetype_font_delete(lv_font_t * font);
+ 
++/** Return a lifetime-unique bitmap-font cache ID, or zero for other font types. */
++uint64_t lv_freetype_bitmap_font_get_cache_id(const lv_font_t * font);
++
++
+ /**
+  * Register a callback function to generate outlines for FreeType fonts.
+  *
+diff --git a/src/libs/freetype/lv_freetype_image.c b/src/libs/freetype/lv_freetype_image.c
+index b51b21f..154f1d8 100644
+--- a/src/libs/freetype/lv_freetype_image.c
++++ b/src/libs/freetype/lv_freetype_image.c
+@@ -71,6 +71,14 @@ lv_cache_t * lv_freetype_create_draw_data_image(uint32_t cache_size)
+     return draw_data_cache;
+ }
+ 
++uint64_t lv_freetype_bitmap_font_get_cache_id(const lv_font_t * font)
++{
++    if(!font || font->get_glyph_bitmap != freetype_get_glyph_bitmap_cb || !font->dsc) return 0;
++    const lv_freetype_font_dsc_t * dsc = font->dsc;
++    if(!LV_FREETYPE_FONT_DSC_HAS_MAGIC_NUM(dsc)) return 0;
++    return dsc->cache_id;
++}
++
+ void lv_freetype_set_cbs_image_font(lv_freetype_font_dsc_t * dsc)
+ {
+     LV_ASSERT_FREETYPE_FONT_DSC(dsc);
+diff --git a/src/libs/freetype/lv_freetype_private.h b/src/libs/freetype/lv_freetype_private.h
+index 86c314e..4cd798f 100644
+--- a/src/libs/freetype/lv_freetype_private.h
++++ b/src/libs/freetype/lv_freetype_private.h
+@@ -113,6 +113,7 @@ typedef struct _lv_freetype_context_t {
+ 
+ typedef struct _lv_freetype_font_dsc_t {
+     uint32_t magic_num;
++    uint64_t cache_id;
+     lv_font_t font;
+     uint32_t size;
+     lv_freetype_font_style_t style;

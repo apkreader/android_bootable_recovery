@@ -1,0 +1,14 @@
+--- a/lv_conf.h
++++ b/lv_conf.h
+@@ -30,7 +30,11 @@
+ #define LV_USE_DRAW_SW_COMPLEX_GRADIENTS 1
+ #define LV_DRAW_SW_SHADOW_CACHE_SIZE 0
+ #define LV_DRAW_SW_CIRCLE_CACHE_SIZE 8
++#if defined(__aarch64__)
++#define LV_USE_DRAW_SW_ASM LV_DRAW_SW_ASM_NEON
++#else
+ #define LV_USE_DRAW_SW_ASM LV_DRAW_SW_ASM_NONE
++#endif
+ 
+ #define LV_DRAW_SW_SUPPORT_RGB565 0
+ #define LV_DRAW_SW_SUPPORT_RGB565_SWAPPED 0

@@ -1,0 +1,11 @@
+--- a/src/draw/convert/neon/lv_draw_buf_convert_neon.c
++++ b/src/draw/convert/neon/lv_draw_buf_convert_neon.c
+@@ -92,7 +92,7 @@
+         }
+ 
+         if(remaining_pixels >= 4) {
+-            uint8x8x4_t rgba;
++            uint8x8x4_t rgba = {0};
+             rgba = vld4_lane_u8(p, rgba, 0);
+             rgba = vld4_lane_u8(p + 4, rgba, 1);
+             rgba = vld4_lane_u8(p + 8, rgba, 2);

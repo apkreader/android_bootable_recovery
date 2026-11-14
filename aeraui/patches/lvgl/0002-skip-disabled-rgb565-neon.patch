@@ -1,0 +1,11 @@
+--- a/src/draw/sw/blend/neon/lv_draw_sw_blend_neon_to_rgb565.c
++++ b/src/draw/sw/blend/neon/lv_draw_sw_blend_neon_to_rgb565.c
+@@ -7,7 +7,7 @@
+  *      INCLUDES
+  *********************/
+ #include "lv_draw_sw_blend_neon_to_rgb565.h"
+-#if LV_USE_DRAW_SW_ASM == LV_DRAW_SW_ASM_NEON
++#if LV_USE_DRAW_SW_ASM == LV_DRAW_SW_ASM_NEON && LV_DRAW_SW_SUPPORT_RGB565
+ 
+ #include "../../../../misc/lv_color.h"
+ #include "../../../../misc/lv_types.h"
